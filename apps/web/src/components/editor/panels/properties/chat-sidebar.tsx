@@ -1030,7 +1030,7 @@ export function ChatSidebar() {
 				{
 					id: "welcome",
 					role: "system",
-					content: "ChronoX AI is ready. Send a command to start editing.",
+					content: "Smart Copilot is ready. Send a command to start editing.",
 				},
 			]);
 			return;
@@ -1048,7 +1048,7 @@ export function ChatSidebar() {
 					{
 						id: "welcome",
 						role: "system",
-						content: "ChronoX AI is ready. Send a command to start editing.",
+						content: "Smart Copilot is ready. Send a command to start editing.",
 					},
 				]);
 			}
@@ -1624,7 +1624,7 @@ export function ChatSidebar() {
 					</div>
 					<div className="flex flex-col leading-tight font-sans">
 						<span className="text-[11px] font-semibold text-foreground">
-							ChronoX AI
+							Smart Copilot
 						</span>
 						<button
 							type="button"
@@ -1689,7 +1689,7 @@ export function ChatSidebar() {
 									id: "welcome",
 									role: "system",
 									content:
-										"ChronoX AI is ready. Send a command to start editing.",
+										"Smart Copilot is ready. Send a command to start editing.",
 								},
 							]);
 							clearGhostState();
