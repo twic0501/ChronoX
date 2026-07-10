@@ -84,6 +84,8 @@ interface AssetsPanelStore {
 	mediaSortBy: MediaSortKey;
 	mediaSortOrder: MediaSortOrder;
 	setMediaSort: (key: MediaSortKey, order: MediaSortOrder) => void;
+	mediaFilter: "all" | "video" | "image" | "audio";
+	setMediaFilter: (filter: "all" | "video" | "image" | "audio") => void;
 }
 
 export const useAssetsPanelStore = create<AssetsPanelStore>()(
@@ -101,6 +103,8 @@ export const useAssetsPanelStore = create<AssetsPanelStore>()(
 			mediaSortOrder: "asc",
 			setMediaSort: (key, order) =>
 				set({ mediaSortBy: key, mediaSortOrder: order }),
+			mediaFilter: "all",
+			setMediaFilter: (filter) => set({ mediaFilter: filter }),
 		}),
 		{
 			name: "assets-panel",
@@ -108,6 +112,7 @@ export const useAssetsPanelStore = create<AssetsPanelStore>()(
 				mediaViewMode: state.mediaViewMode,
 				mediaSortBy: state.mediaSortBy,
 				mediaSortOrder: state.mediaSortOrder,
+				mediaFilter: state.mediaFilter,
 			}),
 		},
 	),

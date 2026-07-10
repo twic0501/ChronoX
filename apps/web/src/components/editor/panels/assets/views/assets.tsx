@@ -16,6 +16,7 @@ import {
 import { VoiceoverButton } from "./voiceover-button";
 import {
 	DropdownMenu,
+	DropdownMenuCheckboxItem,
 	DropdownMenuContent,
 	DropdownMenuItem,
 	DropdownMenuTrigger,
@@ -53,6 +54,7 @@ import {
 	GridViewIcon,
 	LeftToRightListDashIcon,
 	SortingOneNineIcon,
+	FilterMailIcon,
 	Image02Icon,
 	MusicNote03Icon,
 	Video01Icon,
@@ -72,6 +74,8 @@ export function MediaView() {
 		mediaSortBy,
 		mediaSortOrder,
 		setMediaSort,
+		mediaFilter,
+		setMediaFilter,
 	} = useAssetsPanelStore();
 
 	const [isProcessing, setIsProcessing] = useState(false);
@@ -146,7 +150,11 @@ export function MediaView() {
 	};
 
 	const filteredMediaItems = useMemo(() => {
-		const filtered = mediaFiles.filter((item) => !item.ephemeral);
+		const filtered = mediaFiles.filter((item) => {
+			if (item.ephemeral) return false;
+			if (mediaFilter !== "all" && item.type !== mediaFilter) return false;
+			return true;
+		});
 
 		filtered.sort((a, b) => {
 			let valueA: string | number;
@@ -179,7 +187,7 @@ export function MediaView() {
 		});
 
 		return filtered;
-	}, [mediaFiles, mediaSortBy, mediaSortOrder]);
+	}, [mediaFiles, mediaSortBy, mediaSortOrder, mediaFilter]);
 	const orderedMediaIds = useMemo(() => {
 		return filteredMediaItems.map((item) => item.id);
 	}, [filteredMediaItems]);
@@ -199,6 +207,8 @@ export function MediaView() {
 						sortOrder={mediaSortOrder}
 						onSort={handleSort}
 						onImport={openFilePicker}
+						filter={mediaFilter}
+						onFilter={setMediaFilter}
 					/>
 				}
 				className={cn(isDragOver && "bg-accent/30")}
@@ -510,6 +520,8 @@ function MediaActions({
 	sortOrder,
 	onSort,
 	onImport,
+	filter,
+	onFilter,
 }: {
 	mediaViewMode: MediaViewMode;
 	setMediaViewMode: (mode: MediaViewMode) => void;
@@ -518,6 +530,8 @@ function MediaActions({
 	sortOrder: MediaSortOrder;
 	onSort: ({ key }: { key: MediaSortKey }) => void;
 	onImport: () => void;
+	filter: "all" | "video" | "image" | "audio";
+	onFilter: (filter: "all" | "video" | "image" | "audio") => void;
 }) {
 	return (
 		<div className="flex gap-1.5">
@@ -531,7 +545,7 @@ function MediaActions({
 								setMediaViewMode(mediaViewMode === "grid" ? "list" : "grid")
 							}
 							disabled={isProcessing}
-							className="items-center justify-center"
+							className="items-center justify-center h-8 w-8"
 						>
 							{mediaViewMode === "grid" ? (
 								<HugeiconsIcon icon={LeftToRightListDashIcon} />
@@ -556,7 +570,55 @@ function MediaActions({
 									size="icon"
 									variant="ghost"
 									disabled={isProcessing}
-									className="items-center justify-center"
+									className={cn(
+										"items-center justify-center h-8 w-8",
+										filter !== "all" && "bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary",
+									)}
+								>
+									<HugeiconsIcon icon={FilterMailIcon} className="size-4" />
+								</Button>
+							</DropdownMenuTrigger>
+						</TooltipTrigger>
+						<DropdownMenuContent align="end">
+							<DropdownMenuCheckboxItem
+								checked={filter === "all"}
+								onClick={() => onFilter("all")}
+							>
+								All Media
+							</DropdownMenuCheckboxItem>
+							<DropdownMenuCheckboxItem
+								checked={filter === "video"}
+								onClick={() => onFilter("video")}
+							>
+								Videos
+							</DropdownMenuCheckboxItem>
+							<DropdownMenuCheckboxItem
+								checked={filter === "image"}
+								onClick={() => onFilter("image")}
+							>
+								Images
+							</DropdownMenuCheckboxItem>
+							<DropdownMenuCheckboxItem
+								checked={filter === "audio"}
+								onClick={() => onFilter("audio")}
+							>
+								Audio
+							</DropdownMenuCheckboxItem>
+						</DropdownMenuContent>
+					</DropdownMenu>
+					<TooltipContent>
+						<p>Filter: {filter === "all" ? "All types" : filter}</p>
+					</TooltipContent>
+				</Tooltip>
+				<Tooltip>
+					<DropdownMenu>
+						<TooltipTrigger asChild>
+							<DropdownMenuTrigger asChild>
+								<Button
+									size="icon"
+									variant="ghost"
+									disabled={isProcessing}
+									className="items-center justify-center h-8 w-8"
 								>
 									<HugeiconsIcon icon={SortingOneNineIcon} />
 								</Button>
