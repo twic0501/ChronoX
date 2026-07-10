@@ -23,7 +23,7 @@ export function TabBar() {
 	const { activeTab, setActiveTab } = useAssetsPanelStore();
 
 	return (
-		<div className="scrollbar-hidden bg-card/40 flex w-[60px] shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-border/60 py-3">
+		<div className="scrollbar-hidden bg-card/40 flex w-full shrink-0 flex-row items-center gap-2 overflow-x-auto border-b border-border/60 px-3 py-1.5 h-[56px]">
 			{TAB_KEYS.map((tabKey) => {
 				const tab = tabs[tabKey];
 				const isActive = activeTab === tabKey;
@@ -34,16 +34,16 @@ export function TabBar() {
 						aria-label={tab.label}
 						onClick={() => setActiveTab(tabKey)}
 						className={cn(
-							"group relative flex h-[46px] w-[46px] flex-col items-center justify-center gap-1 rounded-[10px] p-0 transition-colors",
+							"group relative flex h-[44px] w-[56px] shrink-0 flex-col items-center justify-center gap-1 rounded-[8px] p-0 transition-colors",
 							isActive
 								? "bg-primary/12 text-primary hover:bg-primary/15 hover:text-primary"
 								: "text-muted-foreground hover:bg-accent hover:text-foreground",
 						)}
 					>
 						{isActive && (
-							<span className="bg-primary absolute -left-1.5 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full" />
+							<span className="bg-primary absolute bottom-0.5 left-1/2 h-[3px] w-5 -translate-x-1/2 rounded-full" />
 						)}
-						<tab.icon className="size-[19px]" />
+						<tab.icon className="size-[18px]" />
 						<span className="text-[8px] font-semibold leading-none tracking-wide">
 							{RAIL_LABELS[tabKey]}
 						</span>
