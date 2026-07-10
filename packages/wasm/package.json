@@ -1,0 +1,8 @@
+{
+  "name": "chronox-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "main": "pkg/chronox_wasm.js",
+  "types": "pkg/chronox_wasm.d.ts",
+  "type": "module"
+}

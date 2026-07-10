@@ -1,0 +1,56 @@
+# Dependencies & build outputs
+node_modules/
+.next/
+out/
+build/
+dist/
+.turbo/
+.cache/
+target/
+**/target/
+packages/wasm/pkg/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV
+env/
+
+# AI Models (CRITICAL: Do not upload weights to GitHub)
+services/ai-worker/models/
+services/core-backend/models/
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Media & scratch outputs
+services/ai-worker/tmp/
+services/ai-worker/*.mp4
+services/core-backend/shared_storage/
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+
+# Env
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+services/ai-worker/shared_storage/
+services/ai-worker/tmp/
+
+# playwright MCP scratch
+.playwright-mcp/
+**/.playwright-mcp/
+*.playwright-mcp

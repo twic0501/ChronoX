@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop",
+    "packages/wasm",
+    "services/core-backend",
+]

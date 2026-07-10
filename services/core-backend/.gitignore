@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Media files
+*.mp4
+*.wav
+*.mp3
+tmp/
+
+# SQLite databases
+*.sqlite
+*.db
