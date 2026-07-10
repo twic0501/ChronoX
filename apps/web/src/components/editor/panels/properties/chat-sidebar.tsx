@@ -1811,7 +1811,7 @@ export function ChatSidebar() {
 							{msg.role === "system" && (
 								<div className="flex items-start gap-1.5 py-0.5">
 									<CircleDot className="size-2.5 mt-0.5 text-muted-foreground/70 shrink-0" />
-									<p className="text-[10px] text-muted-foreground/70 leading-relaxed">
+									<p className="text-[10px] text-muted-foreground/70 leading-relaxed break-words whitespace-pre-wrap">
 										{msg.content}
 									</p>
 								</div>
@@ -1820,7 +1820,7 @@ export function ChatSidebar() {
 							{/* User */}
 							{msg.role === "user" && (
 								<div className="flex justify-end">
-									<div className="max-w-[85%] rounded-md rounded-br-none bg-accent border border-border px-2.5 py-1.5 text-[11px] text-foreground leading-relaxed">
+									<div className="max-w-[85%] rounded-md rounded-br-none bg-accent border border-border px-2.5 py-1.5 text-[11px] text-foreground leading-relaxed break-words whitespace-pre-wrap">
 										{msg.content}
 									</div>
 								</div>
@@ -1845,7 +1845,7 @@ export function ChatSidebar() {
 												)}
 											</button>
 											{isThoughtOpen && (
-												<div className="rounded bg-card/50 border border-border/40 px-2 py-1.5 text-[9px] text-muted-foreground/70 italic leading-relaxed whitespace-pre-line max-h-24 overflow-y-auto">
+												<div className="rounded bg-card/50 border border-border/40 px-2 py-1.5 text-[9px] text-muted-foreground/70 italic leading-relaxed whitespace-pre-line break-words max-h-24 overflow-y-auto">
 													{msg.thought}
 												</div>
 											)}
@@ -1857,7 +1857,7 @@ export function ChatSidebar() {
 										<div className="flex size-4 shrink-0 items-center justify-center rounded bg-agent/15 mt-0.5">
 											<Bot className="size-2.5 text-agent" />
 										</div>
-										<div className="rounded-md rounded-bl-none bg-card/80 border border-border/40 px-2.5 py-1.5 text-[11px] leading-relaxed text-foreground max-w-[90%]">
+										<div className="rounded-md rounded-bl-none bg-card/80 border border-border/40 px-2.5 py-1.5 text-[11px] leading-relaxed text-foreground max-w-[90%] break-words whitespace-pre-wrap">
 											{msg.content}
 										</div>
 									</div>
