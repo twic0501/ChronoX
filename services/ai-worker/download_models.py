@@ -36,26 +36,7 @@ def download_pyannote():
         print(f"⚠️ Warning: Failed to download PyAnnote GGUF: {e}")
         print("ChronoX will fall back to envelope-based VAD analysis when running offline.\n")
 
-def download_yolo():
-    print("--- Downloading yolov12n-seg (PyTorch/ONNX) ---")
-    yolo_dir = os.path.join(MODELS_DIR, "yolo")
-    os.makedirs(yolo_dir, exist_ok=True)
-    try:
-        from ultralytics import YOLO
-        # This will download the model to the current folder or weights cache
-        model = YOLO("yolo12n-seg.pt")
-        # Export to ONNX inside models/yolo
-        onnx_path = os.path.join(yolo_dir, "yolov12n-seg.onnx")
-        if not os.path.exists(onnx_path):
-            exported_path = model.export(format="onnx")
-            os.rename(exported_path, onnx_path)
-            print(f"YOLOv12 exported to ONNX at {onnx_path}")
-        else:
-            print(f"ONNX already exists at {onnx_path}")
-    except Exception as e:
-        print(f"⚠️ Warning: Failed to setup/export YOLOv12 via ultralytics: {e}")
-        print("ChronoX will fall back to analytical segmentation tracking.\n")
-    print("YOLOv12 setup complete.\n")
+# YOLO download removed to keep only upscaling and analytical models
 
 def download_siglip():
     print("--- Downloading siglip2-base-patch16-224-ONNX ---")
@@ -71,26 +52,7 @@ def download_siglip():
         print(f"⚠️ Warning: Failed to download SigLIP2: {e}")
         print("ChronoX will fall back to analytical embeddings.\n")
 
-def download_reid():
-    print("--- Downloading OSNet ReID Model ---")
-    reid_dir = os.path.join(MODELS_DIR, "reid")
-    os.makedirs(reid_dir, exist_ok=True)
-    try:
-        hf_hub_download(
-            repo_id="rotivrotiv/model-weights",
-            filename="osnet_x1_0_market1501.onnx",
-            local_dir=reid_dir,
-            local_dir_use_symlinks=False
-        )
-        # Rename to default
-        src = os.path.join(reid_dir, "osnet_x1_0_market1501.onnx")
-        dst = os.path.join(reid_dir, "osnet_x1_0.onnx")
-        if os.path.exists(src) and not os.path.exists(dst):
-            os.rename(src, dst)
-        print("OSNet ReID download complete.\n")
-    except Exception as e:
-        print(f"⚠️ Warning: Failed to download OSNet: {e}")
-        print("ChronoX will fall back to analytical re-id.\n")
+# ReID download removed to keep only upscaling and analytical models
 
 def download_dat():
     print("--- Downloading DAT-light Model ---")
@@ -117,9 +79,7 @@ def main():
     print("Starting ChronoX Local AI Model Downloader...")
     download_whisper()
     download_pyannote()
-    download_yolo()
     download_siglip()
-    download_reid()
     download_dat()
     print("All models setup completed!")
 
