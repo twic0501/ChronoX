@@ -454,7 +454,7 @@ export function ChatSidebar() {
 	const [isThoughtOpen, setIsThoughtOpen] = useState(false);
 	const [currentThought, setCurrentThought] = useState("");
 	const scrollRef = useRef<HTMLDivElement>(null);
-	const inputRef = useRef<HTMLInputElement>(null);
+	const inputRef = useRef<HTMLTextAreaElement>(null);
 	const [backendConnected, setBackendConnected] = useState(false);
 	const [localModel, setLocalModel] = useState<"qwen3.5:9b" | "gemma4:12b">(
 		"qwen3.5:9b",
@@ -2208,11 +2208,19 @@ export function ChatSidebar() {
 				className="border-t border-border/60 p-1.5 shrink-0"
 			>
 				<div className="flex gap-1">
-					<input
+					<textarea
 						ref={inputRef}
-						type="text"
 						value={input}
 						onChange={(e) => setInput(e.target.value)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter" && !e.shiftKey) {
+								e.preventDefault();
+								if (input.trim()) {
+									handleSubmit(e);
+								}
+							}
+						}}
+						rows={1}
 						placeholder={
 							pendingAsk
 								? "type your answer…"
@@ -2220,7 +2228,7 @@ export function ChatSidebar() {
 									? "AI is generating — type to queue a new command..."
 									: "send command..."
 						}
-						className="flex-1 rounded bg-card/80 border border-border/50 px-2.5 py-1.5 text-[11px] text-foreground outline-none placeholder:text-muted-foreground/50 focus:border-border transition-colors font-mono"
+						className="flex-1 rounded bg-card/80 border border-border/50 px-2.5 py-1.5 text-[11px] text-foreground outline-none placeholder:text-muted-foreground/50 focus:border-border transition-colors font-mono resize-none max-h-24 overflow-y-auto break-all"
 					/>
 					{isThinking && (
 						<Button

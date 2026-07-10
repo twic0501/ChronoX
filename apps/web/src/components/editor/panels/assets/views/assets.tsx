@@ -607,10 +607,10 @@ function MediaActions({
 				onClick={onImport}
 				disabled={isProcessing}
 				size="sm"
-				className="items-center justify-center gap-1.5"
+				className="items-center justify-center gap-1.5 px-2.5"
 			>
 				<HugeiconsIcon icon={CloudUploadIcon} />
-				Import
+				<span className="hidden @[280px]:inline">Import</span>
 			</Button>
 		</div>
 	);

@@ -97,10 +97,10 @@ export function VoiceoverButton() {
 						variant="destructive"
 						size="sm"
 						onClick={stopRecording}
-						className="gap-1.5"
+						className="gap-1.5 px-2.5"
 					>
 						<HugeiconsIcon icon={StopIcon} className="size-4" />
-						Stop
+						<span className="hidden @[280px]:inline">Stop</span>
 					</Button>
 					<div className="flex items-center gap-1.5 text-xs text-destructive animate-pulse">
 						<div className="size-2 rounded-full bg-destructive" />
@@ -112,10 +112,10 @@ export function VoiceoverButton() {
 					variant="outline"
 					size="sm"
 					onClick={startRecording}
-					className="gap-1.5"
+					className="gap-1.5 px-2.5"
 				>
 					<HugeiconsIcon icon={Mic01Icon} className="size-4" />
-					Record Voiceover
+					<span className="hidden @[340px]:inline">Record Voiceover</span>
 				</Button>
 			)}
 		</div>
