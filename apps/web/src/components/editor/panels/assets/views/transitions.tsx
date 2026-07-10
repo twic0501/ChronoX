@@ -74,7 +74,7 @@ export function TransitionsView() {
 					/>
 				</div>
 
-				<div className="grid grid-cols-2 gap-2.5 mt-1">
+				<div className="grid gap-2 mt-1" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(84px, 1fr))" }}>
 					{TRANSITION_TYPES.map((t) => (
 						<TransitionCard
 							key={t.type}
