@@ -490,6 +490,15 @@ export function ChatSidebar() {
 		return { provider: "ollama", model: "qwen3.5:9b", apiKey: "", models: [] };
 	});
 	const [showProviderPanel, setShowProviderPanel] = useState(false);
+	const [agentMode, setAgentMode] = useState<boolean>(() => {
+		try {
+			if (typeof window !== "undefined") {
+				const saved = localStorage.getItem("chronox.ai.agentMode");
+				return saved ? JSON.parse(saved) : false;
+			}
+		} catch {}
+		return false;
+	});
 	const [providerKeyInput, setProviderKeyInput] = useState("");
 	const [providerBusy, setProviderBusy] = useState(false);
 
@@ -1172,118 +1181,120 @@ export function ChatSidebar() {
 
 		// ─── Agentic path: the local model orchestrates editing tools itself ──
 		let toolsExecuted = 0;
-		try {
-			const { runEditingAgent } = await import("@/lib/ai/agent");
-			const controller = new AbortController();
-			abortRef.current = controller;
+		if (agentMode) {
+			try {
+				const { runEditingAgent } = await import("@/lib/ai/agent");
+				const controller = new AbortController();
+				abortRef.current = controller;
 
-			// Checkpoint the undo stack so the whole run can be reverted as one —
-			// the AI never owns the user's timeline, it only proposes on top of it.
-			const startDepth = editor.command.depth?.() ?? 0;
+				// Checkpoint the undo stack so the whole run can be reverted as one —
+				// the AI never owns the user's timeline, it only proposes on top of it.
+				const startDepth = editor.command.depth?.() ?? 0;
 
-			let agentUsage: { input: number; output: number } | undefined;
-			const summary = await runEditingAgent({
-				editor,
-				goal: userPrompt,
-				provider: aiCfg.provider,
-				model: aiCfg.provider === "ollama" ? localModel : aiCfg.model,
-				apiKey: aiCfg.apiKey || undefined,
-				localModel,
-				signal: controller.signal,
-				onAskUser: (question, options) =>
-					new Promise<string>((resolve) => {
-						askResolveRef.current = resolve;
-						setPendingAsk({ question, options });
-						setAiStatus("running", "Waiting for your answer");
-					}),
-				onEvent: (ev) => {
-					if (ev.usage) agentUsage = ev.usage;
-					if (ev.type === "tool" && ev.tool !== "retry") toolsExecuted++;
-					if (ev.type === "tool") {
-						setAiStatus("running", ev.tool);
-						setCurrentThought(`${ev.tool}: ${ev.result ?? ""}`);
-						setMessages((prev) => [
-							...prev,
-							{
-								id: crypto.randomUUID(),
-								role: "system",
-								content: `🔧 ${ev.tool}(${
-									ev.args && Object.keys(ev.args).length
-										? Object.values(ev.args)
-												.map((v) => String(v))
-												.join(", ")
-										: ""
-								}) → ${ev.result ?? ""}`,
-							},
-						]);
-					}
-				},
-			});
+				let agentUsage: { input: number; output: number } | undefined;
+				const summary = await runEditingAgent({
+					editor,
+					goal: userPrompt,
+					provider: aiCfg.provider,
+					model: aiCfg.provider === "ollama" ? localModel : aiCfg.model,
+					apiKey: aiCfg.apiKey || undefined,
+					localModel,
+					signal: controller.signal,
+					onAskUser: (question, options) =>
+						new Promise<string>((resolve) => {
+							askResolveRef.current = resolve;
+							setPendingAsk({ question, options });
+							setAiStatus("running", "Waiting for your answer");
+						}),
+					onEvent: (ev) => {
+						if (ev.usage) agentUsage = ev.usage;
+						if (ev.type === "tool" && ev.tool !== "retry") toolsExecuted++;
+						if (ev.type === "tool") {
+							setAiStatus("running", ev.tool);
+							setCurrentThought(`${ev.tool}: ${ev.result ?? ""}`);
+							setMessages((prev) => [
+								...prev,
+								{
+									id: crypto.randomUUID(),
+									role: "system",
+									content: `🔧 ${ev.tool}(${
+										ev.args && Object.keys(ev.args).length
+											? Object.values(ev.args)
+													.map((v) => String(v))
+													.join(", ")
+											: ""
+									}) → ${ev.result ?? ""}`,
+								},
+							]);
+						}
+					},
+				});
 
-			const usageLine = agentUsage
-				? `\n\n📊 Tokens: ${agentUsage.input.toLocaleString()} in / ${agentUsage.output.toLocaleString()} out (total ${(agentUsage.input + agentUsage.output).toLocaleString()})`
-				: "";
-			// Everything the agent executed sits above the checkpoint — surface it
-			// as a review state with one-click "Undo all" instead of a fait accompli.
-			const editsMade = Math.max(
-				0,
-				(editor.command.depth?.() ?? startDepth) - startDepth,
-			);
-			setMessages((prev) => [
-				...prev,
-				{
-					id: crypto.randomUUID(),
-					role: "assistant",
-					content: (summary || "Done.") + usageLine,
-					status: editsMade > 0 ? "review" : "applied",
-					undoDepth: editsMade,
-				},
-			]);
-			clearGhostState();
-			return;
-		} catch (agentErr: any) {
-			// Never leave a stale question card behind a failed/aborted run.
-			askResolveRef.current = null;
-			setPendingAsk(null);
-			if (agentErr?.name === "AbortError") {
+				const usageLine = agentUsage
+					? `\n\n📊 Tokens: ${agentUsage.input.toLocaleString()} in / ${agentUsage.output.toLocaleString()} out (total ${(agentUsage.input + agentUsage.output).toLocaleString()})`
+					: "";
+				// Everything the agent executed sits above the checkpoint — surface it
+				// as a review state with one-click "Undo all" instead of a fait accompli.
+				const editsMade = Math.max(
+					0,
+					(editor.command.depth?.() ?? startDepth) - startDepth,
+				);
+				setMessages((prev) => [
+					...prev,
+					{
+						id: crypto.randomUUID(),
+						role: "assistant",
+						content: (summary || "Done.") + usageLine,
+						status: editsMade > 0 ? "review" : "applied",
+						undoDepth: editsMade,
+					},
+				]);
+				clearGhostState();
+				return;
+			} catch (agentErr: any) {
+				// Never leave a stale question card behind a failed/aborted run.
+				askResolveRef.current = null;
+				setPendingAsk(null);
+				if (agentErr?.name === "AbortError") {
+					setMessages((prev) => [
+						...prev,
+						{
+							id: crypto.randomUUID(),
+							role: "system",
+							content: "Generation stopped.",
+						},
+					]);
+					return;
+				}
+				console.error("Agent error:", agentErr);
+				// If the agent already executed tools, the timeline is mid-edit —
+				// falling back to the legacy single-shot path would double-apply or
+				// corrupt state. Report honestly and stop; retry continues from here.
+				if (toolsExecuted > 0) {
+					setMessages((prev) => [
+						...prev,
+						{
+							id: crypto.randomUUID(),
+							role: "system",
+							content: `⚠️ Agent stopped after ${toolsExecuted} step(s): ${agentErr?.message ?? agentErr}. The completed steps are kept — resend the request to continue with the rest.`,
+						},
+					]);
+					return;
+				}
+				// No tools ran — safe to fall through to the legacy single-shot path,
+				// but say so: a silent fallback looks like the agent ignoring the user.
 				setMessages((prev) => [
 					...prev,
 					{
 						id: crypto.randomUUID(),
 						role: "system",
-						content: "Generation stopped.",
+						content: `⚠️ Agent mode failed (${agentErr?.message ?? agentErr}) — answering via quick chat instead. Tool-based editing is unavailable for this reply.`,
 					},
 				]);
-				return;
+				abortRef.current = null;
+				setIsThinking(false);
+				setCurrentThought("");
 			}
-			console.error("Agent error:", agentErr);
-			// If the agent already executed tools, the timeline is mid-edit —
-			// falling back to the legacy single-shot path would double-apply or
-			// corrupt state. Report honestly and stop; retry continues from here.
-			if (toolsExecuted > 0) {
-				setMessages((prev) => [
-					...prev,
-					{
-						id: crypto.randomUUID(),
-						role: "system",
-						content: `⚠️ Agent stopped after ${toolsExecuted} step(s): ${agentErr?.message ?? agentErr}. The completed steps are kept — resend the request to continue with the rest.`,
-					},
-				]);
-				return;
-			}
-			// No tools ran — safe to fall through to the legacy single-shot path,
-			// but say so: a silent fallback looks like the agent ignoring the user.
-			setMessages((prev) => [
-				...prev,
-				{
-					id: crypto.randomUUID(),
-					role: "system",
-					content: `⚠️ Agent mode failed (${agentErr?.message ?? agentErr}) — answering via quick chat instead. Tool-based editing is unavailable for this reply.`,
-				},
-			]);
-			abortRef.current = null;
-			setIsThinking(false);
-			setCurrentThought("");
 		}
 
 		setIsThinking(true);
@@ -1316,6 +1327,9 @@ export function ChatSidebar() {
 					timeline_state: timelineState,
 					color_stats: colorStats,
 					scene_map: sceneMap,
+					provider: aiCfg.provider,
+					api_key: aiCfg.apiKey || undefined,
+					model: aiCfg.provider === "ollama" ? localModel : aiCfg.model,
 				}),
 			});
 
@@ -1612,12 +1626,34 @@ export function ChatSidebar() {
 						<span className="text-[11px] font-semibold text-foreground">
 							ChronoX AI
 						</span>
-						<span className="flex items-center gap-1 text-[9px] text-muted-foreground">
+						<button
+							type="button"
+							onClick={() => {
+								if (backendConnected) {
+									const next = !agentMode;
+									setAgentMode(next);
+									localStorage.setItem("chronox.ai.agentMode", JSON.stringify(next));
+									toast.success(next ? "Switched to Agent Mode" : "Switched to Quick Chat");
+								}
+							}}
+							disabled={!backendConnected}
+							className="flex items-center gap-1 text-[9px] text-muted-foreground hover:text-foreground cursor-pointer select-none bg-transparent border-0 p-0"
+						>
 							<span
-								className={`size-1.5 rounded-full ${backendConnected ? "bg-constructive" : "bg-muted-foreground/50"}`}
+								className={`size-1.5 rounded-full ${
+									!backendConnected
+										? "bg-muted-foreground/50"
+										: agentMode
+											? "bg-constructive animate-pulse"
+											: "bg-primary"
+								}`}
 							/>
-							{backendConnected ? "Agent mode" : "Offline"}
-						</span>
+							{!backendConnected
+								? "Offline"
+								: agentMode
+									? "Agent mode (Multi-step)"
+									: "Quick Chat (Single-step)"}
+						</button>
 					</div>
 				</div>
 				<div className="flex items-center gap-1.5">

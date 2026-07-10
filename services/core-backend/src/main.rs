@@ -1545,6 +1545,12 @@ struct ChatRequest {
     time_range: Option<Vec<f64>>,
     local_model: Option<String>,
     obsidian_graph_weights: Option<ObsidianGraphWeights>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 const SYSTEM_PROMPT: &str = r##"You are ChronoX — a professional, highly intelligent AI video editing and audio co-pilot.
@@ -1717,54 +1723,144 @@ async fn chat_handler(
         }),
     ];
 
-    let model_name = params.local_model.as_deref().unwrap_or("qwen3.5:9b");
+    let provider = params
+        .provider
+        .clone()
+        .map(|p| p.to_lowercase())
+        .or_else(|| {
+            params
+                .api_key
+                .as_deref()
+                .and_then(detect_provider_from_key)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "ollama".into());
 
-    // `think: false` disables the model's native reasoning channel so the
-    // answer is emitted directly into `message.content` (the frontend only
-    // reads content). Reasoning models otherwise spend their whole budget in
-    // the hidden `thinking` field and can finish with empty content. The
-    // prompt's own <thought>…</thought> convention still works in content.
-    // Low temperature + JSON-friendly context keeps structured output stable.
-    let payload = serde_json::json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": true,
-        "think": false,
-        "options": {
-            "temperature": 0.3,
-            "num_ctx": 8192,
-            "num_predict": 1024
+    let messages_val = serde_json::json!(messages);
+
+    if provider == "ollama" || provider == "local" {
+        let model_name = params.local_model.as_deref().unwrap_or("qwen3.5:9b");
+        let payload = serde_json::json!({
+            "model": model_name,
+            "messages": messages_val,
+            "stream": true,
+            "think": false,
+            "options": {
+                "temperature": 0.3,
+                "num_ctx": 8192,
+                "num_predict": 1024
+            }
+        });
+
+        let res = match client
+            .post("http://127.0.0.1:11434/api/chat")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to connect to Ollama: {}", e),
+                )
+                    .into_response();
+            }
+        };
+
+        let byte_stream = res.bytes_stream();
+        let pin_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+            Box::pin(byte_stream);
+
+        let body = axum::body::Body::from_stream(pin_stream);
+
+        axum::response::Response::builder()
+            .header("Content-Type", "application/x-ndjson")
+            .header("Transfer-Encoding", "chunked")
+            .body(body)
+            .unwrap()
+            .into_response()
+    } else {
+        let result = match provider.as_str() {
+            "gemini" | "google" => {
+                let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+                        agent_step_gemini(&model, &k, &messages_val, &serde_json::json!([])).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "openai" => {
+                let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+                        agent_step_openai_compat(
+                            &model,
+                            "https://api.openai.com/v1/chat/completions",
+                            &k,
+                            &messages_val,
+                            &serde_json::json!([]),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "grok" | "xai" => {
+                let key = resolve_key(&params.api_key, "XAI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "grok-4-latest".into());
+                        agent_step_openai_compat(
+                            &model,
+                            "https://api.x.ai/v1/chat/completions",
+                            &k,
+                            &messages_val,
+                            &serde_json::json!([]),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "anthropic" | "claude" => {
+                let key = resolve_key(&params.api_key, "ANTHROPIC_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "claude-3-5-haiku-latest".into());
+                        agent_step_anthropic(&model, &k, &messages_val, &serde_json::json!([])).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            other => Err(format!("Unknown provider: {}", other)),
+        };
+
+        match result {
+            Ok(v) => {
+                let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let ndjson_line = serde_json::json!({
+                    "message": {
+                        "role": "assistant",
+                        "content": content
+                    }
+                }).to_string();
+                let response_body = format!("{}\n", ndjson_line);
+
+                axum::response::Response::builder()
+                    .header("Content-Type", "application/x-ndjson")
+                    .body(axum::body::Body::from(response_body))
+                    .unwrap()
+                    .into_response()
+            }
+            Err(e) => {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+            }
         }
-    });
-
-    let res = match client
-        .post("http://127.0.0.1:11434/api/chat")
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to connect to Ollama: {}", e),
-            )
-                .into_response();
-        }
-    };
-
-    let byte_stream = res.bytes_stream();
-    let pin_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
-        Box::pin(byte_stream);
-
-    let body = axum::body::Body::from_stream(pin_stream);
-
-    axum::response::Response::builder()
-        .header("Content-Type", "application/x-ndjson")
-        .header("Transfer-Encoding", "chunked")
-        .body(body)
-        .unwrap()
-        .into_response()
+    }
 }
 
 // ─── Agentic tool-calling step ────────────────────────────────
@@ -2076,9 +2172,11 @@ async fn agent_step_gemini(
 
     let mut req = serde_json::json!({
         "contents": contents,
-        "tools": [{"function_declarations": decls}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024}
     });
+    if !decls.is_empty() {
+        req["tools"] = serde_json::json!([{"function_declarations": decls}]);
+    }
     if !system_text.is_empty() {
         req["system_instruction"] = serde_json::json!({"parts":[{"text": system_text}]});
     }
