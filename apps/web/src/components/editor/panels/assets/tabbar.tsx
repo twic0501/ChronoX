@@ -16,6 +16,7 @@ const RAIL_LABELS: Record<(typeof TAB_KEYS)[number], string> = {
 	sounds: "Audio",
 	text: "Text",
 	effects: "Effects",
+	filters: "Filters",
 	transitions: "Trans.",
 	motion: "Motion",
 	captions: "Caption",

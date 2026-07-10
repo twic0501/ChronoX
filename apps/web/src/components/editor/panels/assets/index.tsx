@@ -7,6 +7,7 @@ import { MediaView } from "./views/assets";
 import { SoundsView } from "./views/sounds";
 import { TextView } from "./views/text";
 import { EffectsView } from "./views/effects";
+import { FiltersView } from "./views/filters";
 import { TransitionsView } from "./views/transitions";
 import { MotionView } from "./views/motion";
 
@@ -18,6 +19,7 @@ export function AssetsPanel() {
 		sounds: <SoundsView />,
 		text: <TextView />,
 		effects: <EffectsView />,
+		filters: <FiltersView />,
 		transitions: <TransitionsView />,
 		motion: <MotionView />,
 		captions: <Captions />,

@@ -20,6 +20,7 @@ export const TAB_KEYS = [
 	"sounds",
 	"text",
 	"effects",
+	"filters",
 	"transitions",
 	"motion",
 	"captions",
@@ -49,6 +50,10 @@ export const tabs = {
 	effects: {
 		icon: createHugeiconsIcon({ icon: MagicWand05Icon }),
 		label: "Effects",
+	},
+	filters: {
+		icon: createHugeiconsIcon({ icon: ColorsIcon }),
+		label: "Filters",
 	},
 	transitions: {
 		icon: createHugeiconsIcon({ icon: ArrowRightDoubleIcon }),
