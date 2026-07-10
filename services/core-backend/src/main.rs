@@ -1916,7 +1916,7 @@ async fn agent_step_handler(
             let key = resolve_key(&payload.api_key, "GEMINI_API_KEY");
             match key {
                 Ok(k) => {
-                    let model = payload.model.unwrap_or_else(|| "gemini-2.5-flash".into());
+                    let model = payload.model.unwrap_or_else(|| "gemini-2.0-flash".into());
                     agent_step_gemini(&model, &k, &payload.messages, &payload.tools).await
                 }
                 Err(e) => Err(e),

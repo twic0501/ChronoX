@@ -478,7 +478,13 @@ export function ChatSidebar() {
 		if (typeof window !== "undefined") {
 			try {
 				const saved = localStorage.getItem("chronox.ai.cfg");
-				if (saved) return JSON.parse(saved);
+				if (saved) {
+					const parsed = JSON.parse(saved);
+					if (parsed.model === "gemini-2.5-flash" || parsed.model === "gemini-2.5-flash-lite") {
+						parsed.model = "gemini-2.0-flash";
+					}
+					return parsed;
+				}
 			} catch {}
 		}
 		return { provider: "ollama", model: "qwen3.5:9b", apiKey: "", models: [] };
@@ -518,7 +524,7 @@ export function ChatSidebar() {
 			}
 			// Sensible default model per vendor (cheap + fast for agent loops).
 			const preferred = [
-				"gemini-2.5-flash",
+				"gemini-2.0-flash",
 				"gpt-5.4-mini",
 				"claude-haiku-4-5",
 				"grok-4-fast",
