@@ -13,6 +13,7 @@ import {
 	listStyleCards,
 	saveStyleCard,
 	deleteStyleCard,
+	searchStyleCards,
 	type StyleCard,
 } from "@/lib/ai/style-library";
 import {
@@ -62,6 +63,7 @@ export function MimicTab() {
 	const [cardTargetTypes, setCardTargetTypes] = useState<Record<string, "timeline" | "selected" | "range">>({});
 	const [cardCustomRanges, setCardCustomRanges] = useState<Record<string, { start: string; end: string }>>({});
 	const [applyingCardId, setApplyingCardId] = useState<string | null>(null);
+	const [searchQuery, setSearchQuery] = useState("");
 
 	// Load saved presets on mount
 	useEffect(() => {
@@ -788,19 +790,55 @@ export function MimicTab() {
 							</span>
 						</div>
 
+						{savedCards.length > 0 && (
+							<div className="relative mt-1 mb-2">
+								<input
+									type="text"
+									value={searchQuery}
+									onChange={(e) => setSearchQuery(e.target.value)}
+									placeholder="Search presets (e.g. 'cinematic', '#color')..."
+									className="w-full bg-background border border-border rounded-lg pl-8 pr-8 py-1.5 text-xs text-foreground focus:outline-none focus:border-agent transition-all placeholder:text-muted-foreground/60"
+								/>
+								<div className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">
+									<Wand2 className="size-3.5" />
+								</div>
+								{searchQuery && (
+									<button
+										onClick={() => setSearchQuery("")}
+										className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
+									>
+										<X className="size-3.5" />
+									</button>
+								)}
+							</div>
+						)}
+
 						{savedCards.length === 0 ? (
 							<p className="text-[10px] text-muted-foreground/60 italic pt-1">
 								No saved preset cards yet. Extract a style reference above to generate and save cards.
 							</p>
-						) : (
-							<div className="space-y-3">
-								{savedCards.map((card) => {
-									const cat = getCategoryStyles(card.category);
-									const isExpanded = expandedCardIds[card.id];
-									const targetType = cardTargetTypes[card.id] || "timeline";
+						) : (() => {
+							const displayedSavedCards = searchQuery.trim()
+								? searchStyleCards(searchQuery)
+								: savedCards;
 
-									return (
-										<div
+							if (displayedSavedCards.length === 0) {
+								return (
+									<p className="text-[10px] text-muted-foreground/60 italic pt-2 text-center">
+										No matching presets found for "{searchQuery}".
+									</p>
+								);
+							}
+
+							return (
+								<div className="space-y-3">
+									{displayedSavedCards.map((card) => {
+										const cat = getCategoryStyles(card.category);
+										const isExpanded = expandedCardIds[card.id];
+										const targetType = cardTargetTypes[card.id] || "timeline";
+
+										return (
+											<div
 											key={card.id}
 											className={`border rounded-xl p-3.5 space-y-3 transition-all ${cat.cardClass}`}
 										>
@@ -977,8 +1015,9 @@ export function MimicTab() {
 									);
 								})}
 							</div>
-						)}
-					</div>
+						);
+					})()}
+				</div>
 				</div>
 			</ScrollArea>
 		</div>

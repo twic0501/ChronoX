@@ -166,3 +166,94 @@ export function deleteStyleCard(id: string): boolean {
 	writeAllCards(next);
 	return true;
 }
+
+export function searchStyleCards(query: string): StyleCard[] {
+	const q = query.trim().toLowerCase();
+	if (!q) return listStyleCards();
+
+	const cards = readAllCards();
+
+	// Parse tags (e.g., "#color" or "category:color")
+	let categoryFilter: string | null = null;
+	const cleanQueryWords: string[] = [];
+	
+	q.split(/\s+/).forEach(word => {
+		if (word.startsWith("#") || word.startsWith("category:")) {
+			const tag = word.replace("#", "").replace("category:", "");
+			if (["color", "transitions", "pacing", "effects"].includes(tag)) {
+				categoryFilter = tag;
+			}
+		} else {
+			cleanQueryWords.push(word);
+		}
+	});
+
+	const cleanQuery = cleanQueryWords.join(" ");
+
+	// Filter Stage 1: Pre-filtering
+	let filtered = cards;
+	if (categoryFilter) {
+		filtered = cards.filter(c => c.category === categoryFilter);
+	}
+
+	if (cleanQueryWords.length === 0) {
+		return filtered;
+	}
+
+	// Helper for text matching score (Jaccard similarity on word list)
+	const getWordSet = (text: string) => new Set(text.toLowerCase().split(/[^a-z0-9]+/));
+	const queryWords = getWordSet(cleanQuery);
+
+	const textScores = filtered.map(card => {
+		const cardText = `${card.name} ${card.summary} ${card.recipeMd}`;
+		const cardWords = getWordSet(cardText);
+		
+		let intersection = 0;
+		queryWords.forEach(w => {
+			if (w && cardWords.has(w)) intersection++;
+		});
+		
+		const union = queryWords.size + cardWords.size - intersection;
+		const score = union > 0 ? intersection / union : 0;
+		return { card, score };
+	});
+
+	// Helper for keyword match score (exact match frequency)
+	const keywordScores = filtered.map(card => {
+		const cardText = `${card.name} ${card.summary} ${card.recipeMd}`.toLowerCase();
+		let score = 0;
+		cleanQueryWords.forEach(w => {
+			if (w && cardText.includes(w)) {
+				score += 1;
+				// Bonus for matching title
+				if (card.name.toLowerCase().includes(w)) score += 2;
+			}
+		});
+		return { card, score };
+	});
+
+	// Rank using RRF (Reciprocal Rank Fusion)
+	const rankedText = [...textScores].sort((a, b) => b.score - a.score);
+	const rankedKeyword = [...keywordScores].sort((a, b) => b.score - a.score);
+
+	const rrfScores = filtered.map(card => {
+		const textRank = rankedText.findIndex(item => item.card.id === card.id);
+		const keywordRank = rankedKeyword.findIndex(item => item.card.id === card.id);
+		
+		// RRF formula: 1 / (60 + rank)
+		const textRRF = textRank >= 0 ? 1 / (60 + textRank) : 0;
+		const keywordRRF = keywordRank >= 0 ? 1 / (60 + keywordRank) : 0;
+		
+		return {
+			card,
+			score: textRRF + keywordRRF
+		};
+	});
+
+	// Sort final results by RRF score and return
+	return rrfScores
+		.filter(item => item.score > 0)
+		.sort((a, b) => b.score - a.score)
+		.map(item => item.card);
+}
+
