@@ -2127,8 +2127,11 @@ async fn extract_recipe_handler(
     let mut title = "Custom Video Style".to_string();
     let mut author = "Unknown".to_string();
     
+    let mut visual_analysis = "No direct visual analysis metadata available.".to_string();
+
     if let Some(ref url) = params.url {
-        if url.contains("youtube.com") || url.contains("youtu.be") {
+        let is_youtube = url.contains("youtube.com") || url.contains("youtu.be");
+        if is_youtube {
             let client = reqwest::Client::new();
             if let Ok(res) = client
                 .get("https://www.youtube.com/oembed")
@@ -2145,15 +2148,55 @@ async fn extract_recipe_handler(
                     }
                 }
             }
+        } else {
+            // Local reference file - run Mixpeek-style visual analyzer
+            let resolved = resolve_static_path_to_abs(url);
+            let client = reqwest::Client::new();
+            if let Ok(res) = client
+                .post("http://127.0.0.1:8001/api/ai/scene-map")
+                .json(&serde_json::json!({
+                    "video_path": resolved,
+                    "threshold": 27.0
+                }))
+                .send()
+                .await
+            {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    if let Some(scenes) = json.get("scenes").and_then(|s| s.as_array()) {
+                        let mut desc = String::new();
+                        for (i, s) in scenes.iter().enumerate() {
+                            let start = s.get("start").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            let end = s.get("end").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            let tag = s.get("contentTag").and_then(|x| x.as_str()).unwrap_or("scenery");
+                            let stats = s.get("colorStats");
+                            let brightness = stats.and_then(|x| x.get("brightness")).and_then(|x| x.as_f64()).unwrap_or(0.5);
+                            let contrast = stats.and_then(|x| x.get("contrast")).and_then(|x| x.as_f64()).unwrap_or(0.1);
+                            let saturation = stats.and_then(|x| x.get("saturation")).and_then(|x| x.as_f64()).unwrap_or(0.1);
+                            let warmth = stats.and_then(|x| x.get("warmth")).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            let dominant = stats.and_then(|x| x.get("dominantColors")).and_then(|x| x.as_array())
+                                .map(|arr| arr.iter().map(|v| v.as_str().unwrap_or("")).collect::<Vec<_>>().join(", "))
+                                .unwrap_or_default();
+                            
+                            desc.push_str(&format!(
+                                "- Scene {} ({:.1}s - {:.1}s): tag={}, brightness={:.2}, contrast={:.2}, saturation={:.2}, warmth={:.2}, colors=[{}]\n",
+                                i, start, end, tag, brightness, contrast, saturation, warmth, dominant
+                            ));
+                        }
+                        if !desc.is_empty() {
+                            visual_analysis = desc;
+                        }
+                    }
+                }
+            }
         }
     }
 
     let description_val = params.description.clone().unwrap_or_default();
     let prompt = format!(
         "You are an expert video editing and colorist consultant. \
-Based on the following reference details, analyze the visual and editing style, and output a JSON object containing a list of modular preset cards (StyleCards). \
+Based on the following reference details and visual frame/color metadata (Mixpeek Extractor), analyze the style, and output a JSON object containing a list of modular preset cards (StyleCards). \
 Each StyleCard represents a specific, independent aspect of the style (e.g. a specific color grading look, transitions kit, pacing rules, or visual effects). \
-If the reference has different visual looks/grades in different scenes, you MUST split them into separate 'color' category cards, each with its corresponding 'time_range' bounds (in seconds, e.g. [0.0, 10.0] or [10.0, 25.0]). Otherwise, set 'time_range' to null. \
+If the reference has different visual looks/grades in different scenes (which you can identify from the Scene Breakdown in the Visual Ingest Profile below), you MUST split them into separate 'color' category cards, each with its corresponding 'time_range' bounds (in seconds, e.g. [0.0, 10.0] or [10.0, 25.0]). Otherwise, set 'time_range' to null. \
 You MUST format the output as a JSON object matching this schema: \
 {{ \
   \"cards\": [ \
@@ -2171,11 +2214,13 @@ Input Reference Details: \
 - Title: {} \
 - Creator: {} \
 - URL: {} \
-- Additional Notes: {}",
+- Additional Notes: {} \
+- Visual Ingest Profile (Mixpeek Extractor):\n{}",
         title,
         author,
         params.url.as_deref().unwrap_or(""),
-        description_val
+        description_val,
+        visual_analysis
     );
 
     let provider = params
