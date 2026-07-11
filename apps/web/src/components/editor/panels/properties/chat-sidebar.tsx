@@ -161,7 +161,7 @@ function getOperationSummary(op: any): string {
 
 // ─── Build timeline snapshot for AI context ──────────────────
 
-function buildTimelineSnapshot(editor: any): string {
+export function buildTimelineSnapshot(editor: any): string {
 	// The creative brief captured at project creation always leads the
 	// context, so every AI reply is steered by the user's stated intent.
 	const brief = editor.project.getActiveOrNull?.()?.metadata?.aiBrief;

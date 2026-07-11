@@ -217,6 +217,8 @@ async fn main() {
         .route("/api/ai/execute", post(execute_ai_task))
         .route("/api/ai/track", post(ai_track_handler))
         .route("/api/ai/chat", post(chat_handler))
+        .route("/api/ai/extract-recipe", post(extract_recipe_handler))
+        .route("/api/ai/apply-recipe", post(apply_recipe_handler))
         .route("/api/project/export", post(export_project_handler))
         .route("/api/ai/mimic-flow", post(ai_mimic_flow_handler))
         .route("/api/ai/scene-map", post(ai_scene_map_handler))
@@ -2017,6 +2019,331 @@ async fn agent_step_handler(
             eprintln!("[agent-step] provider={} error={}", provider, e);
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
+    }
+}
+
+fn extract_json_block(text: &str) -> Option<serde_json::Value> {
+    if let Some(start_idx) = text.find("```") {
+        let content_after = &text[start_idx + 3..];
+        let content_after = if content_after.starts_with("json") {
+            &content_after[4..]
+        } else {
+            content_after
+        };
+        if let Some(end_idx) = content_after.find("```") {
+            let json_str = content_after[..end_idx].trim();
+            if let Ok(v) = serde_json::from_str(json_str) {
+                return Some(v);
+            }
+        }
+    }
+    if let Some(start_idx) = text.find('{') {
+        let mut depth = 0;
+        let mut in_str = false;
+        let mut esc = false;
+        let bytes = text.as_bytes();
+        for i in start_idx..bytes.len() {
+            let ch = bytes[i] as char;
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if ch == '\\' {
+                    esc = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_str = true;
+            } else if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    let json_str = &text[start_idx..=i];
+                    if let Ok(v) = serde_json::from_str(json_str) {
+                        return Some(v);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(serde::Deserialize)]
+struct ExtractRecipeRequest {
+    url: Option<String>,
+    description: Option<String>,
+    api_key: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ExtractRecipeResponse {
+    cards: serde_json::Value,
+}
+
+async fn extract_recipe_handler(
+    State(_state): State<AppState>,
+    Json(params): Json<ExtractRecipeRequest>,
+) -> impl IntoResponse {
+    let mut title = "Custom Video Style".to_string();
+    let mut author = "Unknown".to_string();
+    
+    if let Some(ref url) = params.url {
+        if url.contains("youtube.com") || url.contains("youtu.be") {
+            let client = reqwest::Client::new();
+            if let Ok(res) = client
+                .get("https://www.youtube.com/oembed")
+                .query(&[("url", url.as_str()), ("format", "json")])
+                .send()
+                .await
+            {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    if let Some(t) = json.get("title").and_then(|t| t.as_str()) {
+                        title = t.to_string();
+                    }
+                    if let Some(a) = json.get("author_name").and_then(|a| a.as_str()) {
+                        author = a.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    let description_val = params.description.clone().unwrap_or_default();
+    let prompt = format!(
+        "You are an expert video editing and colorist consultant. \
+Based on the following reference details, analyze the visual and editing style, and output a JSON object containing a list of modular preset cards (StyleCards). \
+Each StyleCard represents a specific, independent aspect of the style (e.g. a specific color grading look, transitions kit, pacing rules, or visual effects). \
+If the reference has different visual looks/grades in different scenes, you MUST split them into separate 'color' category cards, each with its corresponding 'time_range' bounds (in seconds, e.g. [0.0, 10.0] or [10.0, 25.0]). Otherwise, set 'time_range' to null. \
+You MUST format the output as a JSON object matching this schema: \
+{{ \
+  \"cards\": [ \
+    {{ \
+      \"category\": \"color\" | \"transitions\" | \"pacing\" | \"effects\", \
+      \"name\": \"Name of the preset\", \
+      \"time_range\": [start_seconds, end_seconds] or null, \
+      \"summary\": \"1-sentence summary of this preset card\", \
+      \"recipe_md\": \"Detailed editing instructions in Markdown (.md) format describing exactly how to apply this preset (parameters, speed curves, effect params, aspect ratios, etc.)\" \
+    }} \
+  ] \
+}} \
+Ensure only valid JSON is returned in a ```json code block. Write the descriptions and summaries in Vietnamese if the input notes are in Vietnamese, otherwise in English. \
+Input Reference Details: \
+- Title: {} \
+- Creator: {} \
+- URL: {} \
+- Additional Notes: {}",
+        title,
+        author,
+        params.url.as_deref().unwrap_or(""),
+        description_val
+    );
+
+    let provider = params
+        .provider
+        .clone()
+        .map(|p| p.to_lowercase())
+        .or_else(|| {
+            params
+                .api_key
+                .as_deref()
+                .and_then(detect_provider_from_key)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "gemini".into());
+
+    let messages = serde_json::json!([
+        {
+            "role": "system",
+            "content": "You are a professional video editor and style recipe extractor."
+        },
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ]);
+
+    let recipe_result = match provider.as_str() {
+        "gemini" | "google" => {
+            let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
+            match key {
+                Ok(k) => {
+                    let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+                    agent_step_gemini(&model, &k, &messages, &serde_json::json!([])).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "openai" => {
+            let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
+            match key {
+                Ok(k) => {
+                    let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+                    agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &serde_json::json!([])).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        _ => Err(format!("Unsupported provider: {}", provider)),
+    };
+
+    match recipe_result {
+        Ok(val) => {
+            let recipe_text = val.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let json_block = extract_json_block(&recipe_text);
+            let cards = json_block
+                .and_then(|v| v.get("cards").cloned())
+                .unwrap_or_else(|| {
+                    let clean_name = if title == "Custom Video Style" && !description_val.is_empty() {
+                        if description_val.len() > 25 {
+                            format!("{}...", &description_val[0..25])
+                        } else {
+                            description_val.clone()
+                        }
+                    } else {
+                        title
+                    };
+                    serde_json::json!([
+                        {
+                            "category": "effects",
+                            "name": clean_name,
+                            "time_range": null,
+                            "summary": "Extracted editing style guidelines.",
+                            "recipe_md": recipe_text
+                        }
+                    ])
+                });
+
+            (
+                axum::http::StatusCode::OK,
+                Json(ExtractRecipeResponse { cards }),
+            )
+                .into_response()
+        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyRecipeRequest {
+    recipe: String,
+    timeline_state: serde_json::Value,
+    tools: Option<serde_json::Value>,
+    target_clip_id: Option<String>,
+    api_key: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ApplyRecipeResponse {
+    operations: serde_json::Value,
+    explanation: String,
+}
+
+async fn apply_recipe_handler(
+    State(_state): State<AppState>,
+    Json(params): Json<ApplyRecipeRequest>,
+) -> impl IntoResponse {
+    let tools = params.tools.clone().unwrap_or_else(|| serde_json::json!([]));
+    let target_msg = if let Some(ref cid) = params.target_clip_id {
+        format!("Target Clip ID to apply style: {}", cid)
+    } else {
+        "Target the entire timeline (or prioritize the active/first video tracks/clips).".to_string()
+    };
+
+    let user_content = format!(
+        "=== TIMELINE STATE ===\n{}\n=== END TIMELINE STATE ===\n\n\
+=== STYLE PRESET RECIPE ===\n{}\n=== END STYLE PRESET RECIPE ===\n\n\
+{}\n\n\
+Read the style preset recipe and translate its instructions (color grading, pacing/cuts, transitions, effects/transforms) into concrete editor operations on the targeted clip(s)/timeline. \
+Output the JSON block containing the operations: {{\"operations\": [...]}}. Only use valid actions from the schema.",
+        params.timeline_state,
+        params.recipe,
+        target_msg
+    );
+
+    let mut system_prompt = SYSTEM_PROMPT.to_string();
+    system_prompt.push_str("\n\n=== SPECIAL INSTRUCTION ===\nTranslate the provided Markdown Style Recipe into a sequence of editing operations. Keep the explanation very brief. Output the JSON block containing the operations.");
+
+    let provider = params
+        .provider
+        .clone()
+        .map(|p| p.to_lowercase())
+        .or_else(|| {
+            params
+                .api_key
+                .as_deref()
+                .and_then(detect_provider_from_key)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "gemini".into());
+
+    let messages = serde_json::json!([
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": user_content
+        }
+    ]);
+
+    let result = match provider.as_str() {
+        "gemini" | "google" => {
+            let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
+            match key {
+                Ok(k) => {
+                    let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+                    agent_step_gemini(&model, &k, &messages, &tools).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "openai" => {
+            let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
+            match key {
+                Ok(k) => {
+                    let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+                    agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &tools).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        _ => Err(format!("Unsupported provider: {}", provider)),
+    };
+
+    match result {
+        Ok(val) => {
+            let text = val.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let json_block = extract_json_block(&text);
+            let operations = json_block
+                .and_then(|v| v.get("operations").cloned())
+                .unwrap_or_else(|| serde_json::json!([]));
+                
+            let mut explanation = text;
+            if let Some(start_idx) = explanation.find("```") {
+                explanation.truncate(start_idx);
+            }
+            explanation = explanation.replace("<thought>", "").replace("</thought>", "").trim().to_string();
+
+            (
+                axum::http::StatusCode::OK,
+                Json(ApplyRecipeResponse {
+                    operations,
+                    explanation,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 

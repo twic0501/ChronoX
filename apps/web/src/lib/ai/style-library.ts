@@ -32,7 +32,8 @@ export interface SavedStyle {
 	/** Human-readable style summary from the worker (_summarize_style). */
 	summary: string;
 	createdAt: string; // ISO
-	profile: StyleProfileData;
+	profile?: StyleProfileData;
+	recipe?: string; // Markdown recipe text
 }
 
 function readAll(): SavedStyle[] {
@@ -59,7 +60,8 @@ export function saveStyle(input: {
 	name: string;
 	referenceName: string;
 	summary: string;
-	profile: StyleProfileData;
+	profile?: StyleProfileData;
+	recipe?: string;
 }): SavedStyle {
 	const styles = readAll();
 	// Same name → overwrite (user is iterating on the style, not duplicating it)
@@ -76,6 +78,7 @@ export function saveStyle(input: {
 		summary: input.summary,
 		createdAt: new Date().toISOString(),
 		profile: input.profile,
+		recipe: input.recipe,
 	};
 	if (existing >= 0) styles[existing] = style;
 	else styles.push(style);
@@ -103,4 +106,63 @@ export function findStyle(query: string): SavedStyle | undefined {
 				s.name.toLowerCase().includes(q) || q.includes(s.name.toLowerCase()),
 		)
 	);
+}
+
+// ── Style Presets Card-Based Interface & Storage ──
+
+export interface StyleCard {
+	id: string;
+	category: "color" | "transitions" | "pacing" | "effects";
+	name: string;
+	summary: string;
+	timeRange: [number, number] | null;
+	recipeMd: string;
+	createdAt: string;
+	saved: boolean;
+}
+
+const CARDS_STORAGE_KEY = "chronox_style_cards_v1";
+
+function readAllCards(): StyleCard[] {
+	if (typeof window === "undefined") return [];
+	try {
+		const raw = window.localStorage.getItem(CARDS_STORAGE_KEY);
+		const parsed = raw ? JSON.parse(raw) : [];
+		return Array.isArray(parsed) ? parsed : [];
+	} catch {
+		return [];
+	}
+}
+
+function writeAllCards(cards: StyleCard[]) {
+	if (typeof window === "undefined") return;
+	window.localStorage.setItem(CARDS_STORAGE_KEY, JSON.stringify(cards));
+}
+
+export function listStyleCards(): StyleCard[] {
+	return readAllCards().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export function saveStyleCard(card: Omit<StyleCard, "createdAt">): StyleCard {
+	const cards = readAllCards();
+	const existing = cards.findIndex((c) => c.id === card.id);
+	const fullCard: StyleCard = {
+		...card,
+		createdAt: existing >= 0 ? cards[existing].createdAt : new Date().toISOString(),
+	};
+	if (existing >= 0) {
+		cards[existing] = fullCard;
+	} else {
+		cards.push(fullCard);
+	}
+	writeAllCards(cards);
+	return fullCard;
+}
+
+export function deleteStyleCard(id: string): boolean {
+	const cards = readAllCards();
+	const next = cards.filter((c) => c.id !== id);
+	if (next.length === cards.length) return false;
+	writeAllCards(next);
+	return true;
 }
