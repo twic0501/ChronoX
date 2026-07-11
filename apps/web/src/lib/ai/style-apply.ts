@@ -499,7 +499,7 @@ export async function applySavedStyle(
 	intensity = 1,
 ): Promise<ApplyStyleResult> {
 	const data = await fetchMimicFlow(editor, {
-		referenceProfile: style.profile,
+		referenceProfile: style.profile as any,
 	});
 	if (data.status !== "success")
 		throw new Error(data.error || "Style adaptation failed.");

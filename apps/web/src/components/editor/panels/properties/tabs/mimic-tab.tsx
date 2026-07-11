@@ -43,6 +43,9 @@ export function MimicTab() {
 	const tracks = useEditor((e) => e.timeline.getTracks());
 	const selectedElements = useEditor((e) => e.selection.getSelectedElements());
 	const ghostClips = useEditorStore((s) => s.ghostClips);
+	const selectedElementName = selectedElements.length > 0
+		? (tracks.find(t => t.id === selectedElements[0].trackId)?.elements.find(e => e.id === selectedElements[0].elementId)?.name || "Selected Clip")
+		: "";
 
 	// --- 1. Style Reference Input States ---
 	const [urlInput, setUrlInput] = useState("");
@@ -229,7 +232,7 @@ export function MimicTab() {
 				toast.error("Please select a clip on the timeline first.");
 				return;
 			}
-			targetClipId = selectedElements[0].id;
+			targetClipId = selectedElements[0].elementId;
 		}
 
 		setApplyingCardId(card.id);
@@ -739,7 +742,7 @@ export function MimicTab() {
 													) : targetType === "selected" ? (
 														<span className="text-[10px] text-muted-foreground italic h-7 flex items-center leading-tight">
 															{selectedElements.length > 0
-																? `Targeting clip "${selectedElements[0].name}"`
+																? `Targeting clip "${selectedElementName}"`
 																: "Select clip on timeline"}
 														</span>
 													) : (
@@ -941,7 +944,7 @@ export function MimicTab() {
 													) : targetType === "selected" ? (
 														<span className="text-[10px] text-muted-foreground italic h-7 flex items-center leading-tight">
 															{selectedElements.length > 0
-																? `Targeting clip "${selectedElements[0].name}"`
+																? `Targeting clip "${selectedElementName}"`
 																: "Select clip on timeline"}
 														</span>
 													) : (
