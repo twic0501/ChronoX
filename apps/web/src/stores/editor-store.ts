@@ -14,6 +14,8 @@ export type GhostClip = Partial<TimelineElement> & {
 	operationId: string;
 	isInvalid: boolean;
 	operationData?: any;
+	isPendingDelete?: boolean;
+	isPendingSplit?: boolean;
 };
 
 export interface Keyframe {

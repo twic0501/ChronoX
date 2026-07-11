@@ -14,6 +14,7 @@ import type { ElementDragState } from "@/lib/timeline";
 import { useEditor } from "@/hooks/use-editor";
 import { useEditorStore } from "@/stores/editor-store";
 import { TransitionCutButton } from "./transition-cut-button";
+import { toast } from "sonner";
 
 interface TimelineTrackContentProps {
 	track: TimelineTrack;
@@ -120,20 +121,81 @@ export function TimelineTrackContent({
 					if (clip.isInvalid) return null;
 					const left =
 						clip.start * TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel;
-					const width =
+					const width = Math.max(
+						2,
 						(clip.end - clip.start) *
-						TIMELINE_CONSTANTS.PIXELS_PER_SECOND *
-						zoomLevel;
+							TIMELINE_CONSTANTS.PIXELS_PER_SECOND *
+							zoomLevel,
+					);
+
+					const handleRemove = (e: React.MouseEvent) => {
+						e.stopPropagation();
+						e.preventDefault();
+						const store = useEditorStore.getState();
+						store.setGhostClips(store.ghostClips.filter((c) => c.id !== clip.id));
+						toast.info(`Removed pending action: ${clip.label}`);
+					};
+
+					if (clip.isPendingSplit) {
+						return (
+							<div
+								key={clip.id}
+								onContextMenu={handleRemove}
+								onClick={handleRemove}
+								title="Proposed Cut (Click or Right-click to remove)"
+								className="absolute top-0 bottom-0 w-[4px] bg-amber-500 hover:bg-amber-600 cursor-pointer z-30 border-l border-r border-dashed border-amber-600 flex items-center justify-center group"
+								style={{
+									left: `${left}px`,
+								}}
+							>
+								<div className="hidden group-hover:block absolute bottom-full mb-1 bg-amber-600 text-white text-[8px] font-semibold py-0.5 px-1.5 rounded shadow-lg whitespace-nowrap z-50">
+									Proposed Cut (Click to remove)
+								</div>
+							</div>
+						);
+					}
+
+					if (clip.isPendingDelete) {
+						return (
+							<div
+								key={clip.id}
+								onContextMenu={handleRemove}
+								className="absolute top-0.5 bottom-0.5 bg-destructive/20 hover:bg-destructive/30 border border-dashed border-destructive/60 hover:border-destructive/80 rounded-sm z-30 flex items-center justify-center text-[9px] text-destructive-foreground font-medium select-none px-2 text-center group cursor-pointer"
+								style={{
+									left: `${left}px`,
+									width: `${width}px`,
+								}}
+							>
+								<span>{clip.label || "To be deleted"}</span>
+								<button
+									type="button"
+									onClick={handleRemove}
+									className="absolute top-0.5 right-0.5 size-3.5 bg-destructive/60 hover:bg-destructive text-white rounded-full items-center justify-center hidden group-hover:flex text-[8px] font-bold cursor-pointer"
+								>
+									✕
+								</button>
+							</div>
+						);
+					}
+
 					return (
 						<div
 							key={clip.id}
-							className="absolute top-0.5 bottom-0.5 bg-agent/10 border border-dashed border-agent/70 rounded-sm z-30 pointer-events-none flex items-center justify-center text-[9px] text-agent font-medium select-none px-2 text-center"
+							onContextMenu={handleRemove}
+							className="absolute top-0.5 bottom-0.5 bg-agent/10 hover:bg-agent/20 border border-dashed border-agent/70 hover:border-agent/90 rounded-sm z-30 flex items-center justify-center text-[9px] text-agent font-medium select-none px-2 text-center group cursor-pointer"
 							style={{
 								left: `${left}px`,
 								width: `${width}px`,
 							}}
 						>
-							{clip.label}
+							<span>{clip.label}</span>
+							<button
+								type="button"
+								onClick={handleRemove}
+								className="absolute top-0.5 right-0.5 size-3.5 bg-agent/60 hover:bg-agent text-white rounded-full items-center justify-center hidden group-hover:flex text-[8px] font-bold cursor-pointer"
+							>
+								✕
+							</button>
 						</div>
 					);
 				})}

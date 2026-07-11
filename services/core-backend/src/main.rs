@@ -219,6 +219,7 @@ async fn main() {
         .route("/api/ai/chat", post(chat_handler))
         .route("/api/ai/extract-recipe", post(extract_recipe_handler))
         .route("/api/ai/apply-recipe", post(apply_recipe_handler))
+        .route("/api/ai/synthesize-sources", post(synthesize_sources_handler))
         .route("/api/project/export", post(export_project_handler))
         .route("/api/ai/mimic-flow", post(ai_mimic_flow_handler))
         .route("/api/ai/scene-map", post(ai_scene_map_handler))
@@ -2227,6 +2228,140 @@ Input Reference Details: \
             (
                 axum::http::StatusCode::OK,
                 Json(ExtractRecipeResponse { cards }),
+            )
+                .into_response()
+        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SourceItem {
+    id: String,
+    #[serde(rename = "type")]
+    source_type: String,
+    name: String,
+    content: String,
+    url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SynthesizeSourcesRequest {
+    prompt: String,
+    sources: Vec<SourceItem>,
+    timeline_state: serde_json::Value,
+    provider: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SynthesizeSourcesResponse {
+    explanation: String,
+    cards: serde_json::Value,
+}
+
+async fn synthesize_sources_handler(
+    State(_state): State<AppState>,
+    Json(params): Json<SynthesizeSourcesRequest>,
+) -> impl IntoResponse {
+    let mut sources_text = String::new();
+    for (idx, source) in params.sources.iter().enumerate() {
+        sources_text.push_str(&format!(
+            "--- SOURCE {} (Name: \"{}\", Type: \"{}\") ---\n{}\n\n",
+            idx + 1,
+            source.name,
+            source.source_type,
+            source.content
+        ));
+    }
+
+    let user_content = format!(
+        "=== SOURCE DOCUMENTS ===\n{}\n=== END SOURCE DOCUMENTS ===\n\n\
+         === CURRENT TIMELINE STATE ===\n{}\n=== END TIMELINE STATE ===\n\n\
+         === USER QUERY/PROMPT ===\n{}\n\n\
+         Synthesize the provided source documents and answer the user query based on them. \
+         Also generate zero, one, or more modular Preset Cards that can be applied to the timeline. \
+         Keep the explanation brief. Output the cards as a JSON block with this schema: \
+         {{\"explanation\": \"...\", \"cards\": [ {{\"category\": \"color\"|\"transitions\"|\"pacing\"|\"effects\", \"name\": \"Preset Name\", \"time_range\": [start, end] or null, \"summary\": \"preset summary\", \"recipe_md\": \"markdown recipe\"}} ] }}.",
+        sources_text,
+        params.timeline_state,
+        params.prompt
+    );
+
+    let system_prompt = "You are a professional video editor and style synthesis assistant. \
+                         Your goal is to extract visual guidelines, pacing rules, transitions, and effects from multiple source materials (NotebookLM style) and translate them into a summary and modular preset cards.";
+
+    let messages = serde_json::json!([
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": user_content
+        }
+    ]);
+
+    let provider = params
+        .provider
+        .clone()
+        .map(|p| p.to_lowercase())
+        .unwrap_or_else(|| "gemini".into());
+
+    let result = match provider.as_str() {
+        "gemini" | "google" => {
+            let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
+            match key {
+                Ok(k) => {
+                    let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+                    agent_step_gemini(&model, &k, &messages, &serde_json::json!([])).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "openai" => {
+            let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
+            match key {
+                Ok(k) => {
+                    let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+                    agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &serde_json::json!([])).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "ollama" | "local" => {
+            let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
+            agent_step_ollama(&model, &messages, &serde_json::json!([])).await
+        }
+        _ => Err(format!("Unsupported provider: {}", provider)),
+    };
+
+    match result {
+        Ok(val) => {
+            let text = val.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let json_block = extract_json_block(&text);
+            
+            let explanation = json_block
+                .as_ref()
+                .and_then(|v| v.get("explanation").and_then(|e| e.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let mut exp = text.clone();
+                    if let Some(start_idx) = exp.find("```") {
+                        exp.truncate(start_idx);
+                    }
+                    exp.trim().to_string()
+                });
+
+            let cards = json_block
+                .as_ref()
+                .and_then(|v| v.get("cards").cloned())
+                .unwrap_or_else(|| serde_json::json!([]));
+
+            (
+                axum::http::StatusCode::OK,
+                Json(SynthesizeSourcesResponse { explanation, cards }),
             )
                 .into_response()
         }

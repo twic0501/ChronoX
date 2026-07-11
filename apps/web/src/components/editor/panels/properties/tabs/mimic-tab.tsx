@@ -19,6 +19,14 @@ import {
 	deleteStyleCard,
 	type StyleCard,
 } from "@/lib/ai/style-library";
+import {
+	listSources,
+	saveSource,
+	deleteSource,
+	toggleSelectSource,
+	clearSources,
+	type SourceItem,
+} from "@/lib/ai/source-hub";
 import { applySavedStyle } from "@/lib/ai/style-apply";
 import {
 	Film,
@@ -41,8 +49,12 @@ import {
 	FileText,
 	ChevronDown,
 	ChevronUp,
-	Edit3,
 	BookOpen,
+	Plus,
+	CheckSquare,
+	Square,
+	Search,
+	Eye,
 } from "lucide-react";
 
 export function MimicTab() {
@@ -50,30 +62,40 @@ export function MimicTab() {
 	const activeProject = useEditor((e) => e.project.getActive());
 	const tracks = useEditor((e) => e.timeline.getTracks());
 	const selectedElements = useEditor((e) => e.selection.getSelectedElements());
+	const ghostClips = useEditorStore((s) => s.ghostClips);
 
 	// Tab switcher: "presets" (new modular cards path) vs "source" (original video analysis path)
 	const [activeTab, setActiveTab] = useState<"presets" | "source">("presets");
 
-	// --- 1. Custom Presets States ---
-	const [urlInput, setUrlInput] = useState("");
-	const [descriptionInput, setDescriptionInput] = useState("");
-	const [isExtracting, setIsExtracting] = useState(false);
+	// --- 1. Sources & NotebookLM States ---
+	const [sources, setSources] = useState<SourceItem[]>([]);
+	const [newUrl, setNewUrl] = useState("");
+	const [newTextName, setNewTextName] = useState("");
+	const [newTextContent, setNewTextContent] = useState("");
+	const [isAddingSource, setIsAddingSource] = useState(false);
+	const [showAddTextModal, setShowAddTextModal] = useState(false);
+
+	// --- 2. Custom Presets & Synthesis States ---
+	const [synthesisPrompt, setSynthesisPrompt] = useState("");
+	const [isSynthesizing, setIsSynthesizing] = useState(false);
+	const [synthesisExplanation, setSynthesisExplanation] = useState("");
 	const [extractedCards, setExtractedCards] = useState<StyleCard[]>([]);
 	const [savedCards, setSavedCards] = useState<StyleCard[]>([]);
+	
 	const [expandedCardIds, setExpandedCardIds] = useState<Record<string, boolean>>({});
-	const [editingCardIds, setEditingCardIds] = useState<Record<string, boolean>>({});
 	const [cardRecipes, setCardRecipes] = useState<Record<string, string>>({});
 	const [cardNames, setCardNames] = useState<Record<string, string>>({});
 	const [cardTargetTypes, setCardTargetTypes] = useState<Record<string, "timeline" | "selected" | "range">>({});
 	const [cardCustomRanges, setCardCustomRanges] = useState<Record<string, { start: string; end: string }>>({});
 	const [applyingCardId, setApplyingCardId] = useState<string | null>(null);
 
-	// Load saved cards on mount
+	// Load stored sources & saved presets on mount
 	useEffect(() => {
+		setSources(listSources());
 		setSavedCards(listStyleCards());
 	}, []);
 
-	// --- 2. Original Upload & Mimic States ---
+	// --- 3. Original Upload & Mimic States ---
 	const {
 		referenceFile,
 		isUploading,
@@ -82,7 +104,6 @@ export function MimicTab() {
 		targetDuration,
 		selectedAudioId,
 		snappedCuts,
-		apiMutations,
 		mimicStats,
 		lastAnalysis,
 		styleName,
@@ -106,7 +127,6 @@ export function MimicTab() {
 	};
 
 	const acceptCuts = () => {
-		// Run compiler commands
 		toast.success("Applied cutting tempo to timeline.");
 		clearProposal();
 		useEditorStore.getState().setGhostClips([]);
@@ -262,7 +282,7 @@ export function MimicTab() {
 		}
 	};
 
-	// --- 3. Style Presets (Link / Description) Logic ---
+	// --- 4. NotebookLM Source Hub Logic ---
 	const getAiCfg = () => {
 		if (typeof window !== "undefined") {
 			try {
@@ -273,23 +293,29 @@ export function MimicTab() {
 		return { provider: "ollama", model: "qwen3.5:9b", apiKey: "" };
 	};
 
-	const handleExtractRecipe = async () => {
-		if (!urlInput.trim() && !descriptionInput.trim()) {
-			toast.error("Please paste a URL or write a text description.");
-			return;
-		}
-
-		setIsExtracting(true);
+	const handleAddYoutubeSource = async () => {
+		if (!newUrl.trim()) return;
+		setIsAddingSource(true);
 		const aiCfg = getAiCfg();
 		const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
 		try {
+			// Query oembed for title, then extract outline
+			const oembedRes = await fetch(
+				`https://www.youtube.com/oembed?url=${encodeURIComponent(newUrl.trim())}&format=json`,
+			);
+			let title = "YouTube Video Source";
+			if (oembedRes.ok) {
+				const info = await oembedRes.json();
+				title = info.title || title;
+			}
+
+			// Call backend to perform a simple recipe/transcript crawl
 			const res = await fetch(`${API_URL}/api/ai/extract-recipe`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
-					url: urlInput.trim() || undefined,
-					description: descriptionInput.trim() || undefined,
+					url: newUrl.trim(),
 					provider: aiCfg.provider,
 					api_key: aiCfg.apiKey || undefined,
 					model: aiCfg.provider === "ollama" ? "qwen3.5:9b" : aiCfg.model,
@@ -297,17 +323,104 @@ export function MimicTab() {
 			});
 
 			if (!res.ok) {
-				throw new Error("Style extraction failed on the server.");
+				throw new Error("Failed to fetch YouTube details.");
 			}
 
 			const data = await res.json();
-			const cardsList = data.cards || [];
-			if (cardsList.length === 0) {
-				toast.info("No style presets could be extracted.");
-				return;
+			const outlineMd = data.cards?.[0]?.recipe_md || "No transcript details available.";
+
+			const item = saveSource({
+				id: `source_yt_${Date.now()}`,
+				type: "youtube",
+				name: title,
+				content: outlineMd,
+				url: newUrl.trim(),
+				selected: true,
+				createdAt: Date.now(),
+			});
+
+			setSources(listSources());
+			setNewUrl("");
+			toast.success(`Source "${title}" added!`);
+		} catch (err: any) {
+			toast.error(err?.message || "Failed to add YouTube source.");
+		} finally {
+			setIsAddingSource(false);
+		}
+	};
+
+	const handleAddTextSource = () => {
+		if (!newTextName.trim() || !newTextContent.trim()) {
+			toast.error("Please provide both name and content.");
+			return;
+		}
+
+		saveSource({
+			id: `source_txt_${Date.now()}`,
+			type: "text",
+			name: newTextName.trim(),
+			content: newTextContent.trim(),
+			selected: true,
+			createdAt: Date.now(),
+		});
+
+		setSources(listSources());
+		setNewTextName("");
+		setNewTextContent("");
+		setShowAddTextModal(false);
+		toast.success("Text brief added to Source Hub.");
+	};
+
+	const handleToggleSource = (id: string) => {
+		const updated = toggleSelectSource(id);
+		setSources(updated);
+	};
+
+	const handleDeleteSource = (id: string) => {
+		deleteSource(id);
+		setSources(listSources());
+		toast.info("Source removed.");
+	};
+
+	// --- 5. Custom Presets & Multi-Source Synthesis ---
+	const handleSynthesizeSources = async () => {
+		const activeSources = sources.filter((s) => s.selected);
+		if (activeSources.length === 0) {
+			toast.error("Please select at least one source document in the hub.");
+			return;
+		}
+		if (!synthesisPrompt.trim()) {
+			toast.error("Please enter a query or target style description.");
+			return;
+		}
+
+		setIsSynthesizing(true);
+		const aiCfg = getAiCfg();
+		const timelineState = buildTimelineSnapshot(editor);
+		const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+
+		try {
+			const res = await fetch(`${API_URL}/api/ai/synthesize-sources`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					prompt: synthesisPrompt.trim(),
+					sources: activeSources,
+					timeline_state: timelineState,
+					provider: aiCfg.provider,
+					api_key: aiCfg.apiKey || undefined,
+					model: aiCfg.provider === "ollama" ? "qwen3.5:9b" : aiCfg.model,
+				}),
+			});
+
+			if (!res.ok) {
+				throw new Error("Synthesis failed on the server.");
 			}
 
-			// Format into StyleCards
+			const data = await res.json();
+			setSynthesisExplanation(data.explanation || "");
+			
+			const cardsList = data.cards || [];
 			const formattedCards: StyleCard[] = cardsList.map((c: any, index: number) => ({
 				id: `extracted_${Date.now()}_${index}`,
 				category: c.category || "effects",
@@ -319,7 +432,7 @@ export function MimicTab() {
 			}));
 
 			setExtractedCards(formattedCards);
-			
+
 			// Pre-fill names & recipes state
 			const nameState: Record<string, string> = {};
 			const recipeState: Record<string, string> = {};
@@ -330,19 +443,19 @@ export function MimicTab() {
 			setCardNames((prev) => ({ ...prev, ...nameState }));
 			setCardRecipes((prev) => ({ ...prev, ...recipeState }));
 
-			toast.success(`Successfully extracted ${formattedCards.length} style presets!`);
+			toast.success("Synthesis completed! Presets generated below.");
 		} catch (err: any) {
-			toast.error(err?.message || "Failed to extract style.");
+			toast.error(err?.message || "Synthesis failed.");
 		} finally {
-			setIsExtracting(false);
+			setIsSynthesizing(false);
 		}
 	};
 
 	const handleSaveCard = (card: StyleCard) => {
 		const name = cardNames[card.id]?.trim() || card.name;
 		const recipe = cardRecipes[card.id] || card.recipeMd;
-		
-		const saved = saveStyleCard({
+
+		saveStyleCard({
 			id: card.id.startsWith("extracted_") ? `saved_${Date.now()}_${Math.random()}` : card.id,
 			category: card.category,
 			name,
@@ -352,7 +465,6 @@ export function MimicTab() {
 			saved: true,
 		});
 
-		// Refresh lists
 		setSavedCards(listStyleCards());
 		setExtractedCards((prev) => prev.map((c) => (c.id === card.id ? { ...c, saved: true } : c)));
 		toast.success(`Preset "${name}" saved to library.`);
@@ -365,14 +477,15 @@ export function MimicTab() {
 		toast.info(`Preset "${card.name}" removed.`);
 	};
 
-	const handleApplyCard = async (card: StyleCard) => {
+	// --- Interactive Review Mode (One-Shot Proposed Edits) ---
+	const handleApplyCardReview = async (card: StyleCard) => {
 		const aiCfg = getAiCfg();
 		const timelineState = buildTimelineSnapshot(editor);
 		const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
 		const recipeText = cardRecipes[card.id] || card.recipeMd;
 		const targetType = cardTargetTypes[card.id] || "timeline";
-		
+
 		let targetClipId: string | undefined = undefined;
 		if (targetType === "selected") {
 			if (selectedElements.length === 0) {
@@ -383,7 +496,7 @@ export function MimicTab() {
 		}
 
 		setApplyingCardId(card.id);
-		toast.loading(`Translating "${card.name}" recipe to timeline...`, { id: "apply-recipe" });
+		toast.loading(`Analyzing style changes for review...`, { id: "apply-recipe" });
 
 		try {
 			const customRange = cardCustomRanges[card.id];
@@ -408,40 +521,170 @@ export function MimicTab() {
 			});
 
 			if (!res.ok) {
-				throw new Error("Failed to compile operations from recipe.");
+				throw new Error("Failed to compile operations.");
 			}
 
 			const data = await res.json();
 			const ops = data.operations || [];
 			if (ops.length === 0) {
 				toast.dismiss("apply-recipe");
-				toast.info("No timeline changes generated. Try refining the recipe.");
+				toast.info("No timeline changes generated.");
 				return;
 			}
 
-			const { BatchCommand } = await import("@/lib/commands/batch-command");
-			const { dryRunActions } = await import("@/lib/ai/compiler");
+			// Resolve operations to visual timeline proposed cards (ghost clips)
+			const videoTrack = tracks.find((t) => t.type === "video");
+			const trackId = videoTrack?.id || "video_track";
+			const clips = videoTrack?.elements || [];
 
-			const dry = dryRunActions(ops, editor, { strict: false });
-			if (dry.success && dry.commands && dry.commands.length > 0) {
-				editor.command.execute({ command: new BatchCommand(dry.commands) });
-				toast.success(`Applied: ${data.explanation || "Edits successfully applied!"}`, { id: "apply-recipe" });
-			} else {
-				throw new Error("Could not map edits to timeline clips.");
-			}
+			const proposedGhostClips: any[] = [];
+			
+			ops.forEach((op: any, index: number) => {
+				const uuid = `proposed_${Date.now()}_${index}`;
+				if (op.action === "split") {
+					proposedGhostClips.push({
+						id: uuid,
+						trackId: op.track_id || trackId,
+						start: op.time,
+						end: op.time,
+						type: "split",
+						label: `Proposed Cut (${op.time.toFixed(1)}s)`,
+						operationId: "split",
+						isPendingSplit: true,
+						isInvalid: false,
+						operationData: op,
+					});
+				} else if (op.action === "delete") {
+					const targetClip = clips.find((c) => c.id === op.clip_id);
+					if (targetClip) {
+						proposedGhostClips.push({
+							id: uuid,
+							trackId: trackId,
+							start: targetClip.startTime,
+							end: targetClip.startTime + targetClip.duration,
+							type: "delete",
+							label: `Remove Clip "${targetClip.name}"`,
+							operationId: "delete",
+							isPendingDelete: true,
+							isInvalid: false,
+							originalClipId: targetClip.id,
+							operationData: op,
+						});
+					}
+				} else if (op.action === "trim") {
+					const targetClip = clips.find((c) => c.id === op.clip_id);
+					if (targetClip) {
+						const clipStart = targetClip.startTime;
+						const clipEnd = clipStart + targetClip.duration;
+						
+						// trim keeps [start, end]. Faded red region for cut-outs:
+						if (op.start > 0) {
+							proposedGhostClips.push({
+								id: `${uuid}_trim_l`,
+								trackId: trackId,
+								start: clipStart,
+								end: clipStart + op.start,
+								type: "trim_left",
+								label: "Trim Out Left",
+								operationId: "delete",
+								isPendingDelete: true,
+								isInvalid: false,
+								operationData: { action: "trim_cut", clip_id: op.clip_id, start: 0, end: op.start },
+							});
+						}
+						
+						if (op.end < targetClip.duration) {
+							proposedGhostClips.push({
+								id: `${uuid}_trim_r`,
+								trackId: trackId,
+								start: clipStart + op.end,
+								end: clipEnd,
+								type: "trim_right",
+								label: "Trim Out Right",
+								operationId: "delete",
+								isPendingDelete: true,
+								isInvalid: false,
+								operationData: { action: "trim_cut", clip_id: op.clip_id, start: op.end, end: targetClip.duration },
+							});
+						}
+					}
+				} else {
+					// standard edits like adjust_color
+					const targetClip = clips.find((c) => c.id === op.clip_id);
+					proposedGhostClips.push({
+						id: uuid,
+						trackId: trackId,
+						start: targetClip?.startTime ?? 0,
+						end: targetClip ? targetClip.startTime + targetClip.duration : 5,
+						type: op.action,
+						label: `Change: ${op.action}`,
+						operationId: op.action,
+						isPendingDelete: false,
+						isPendingSplit: false,
+						isInvalid: false,
+						operationData: op,
+					});
+				}
+			});
+
+			useEditorStore.getState().setGhostClips(proposedGhostClips);
+			toast.success("Presets loaded as pending edits on the timeline. Hover/right-click to edit, or confirm below.", { id: "apply-recipe" });
 		} catch (err: any) {
-			toast.error(err?.message || "Failed to apply recipe.", { id: "apply-recipe" });
+			toast.error(err?.message || "Failed to preview preset.", { id: "apply-recipe" });
 		} finally {
 			setApplyingCardId(null);
 		}
 	};
 
-	const toggleExpandCard = (id: string) => {
-		setExpandedCardIds((prev) => ({ ...prev, [id]: !prev[id] }));
+	const handleConfirmProposedEdits = async () => {
+		const remainingOps = ghostClips
+			.map((c) => c.operationData)
+			.filter(Boolean);
+
+		if (remainingOps.length === 0) {
+			toast.info("No active edits left to apply.");
+			useEditorStore.getState().clearGhostClips();
+			return;
+		}
+
+		try {
+			const { BatchCommand } = await import("@/lib/commands/batch-command");
+			const { dryRunActions } = await import("@/lib/ai/compiler");
+
+			// We need to resolve custom trim_cut back to valid timeline trim commands
+			const normalizedOps = remainingOps.map((op) => {
+				if (op.action === "trim_cut") {
+					return {
+						action: "trim",
+						clip_id: op.clip_id,
+						start: op.end, // keep from end onwards
+						end: 9999, // default max
+					};
+				}
+				return op;
+			});
+
+			const dry = dryRunActions(normalizedOps, editor, { strict: false });
+			if (dry.success && dry.commands && dry.commands.length > 0) {
+				editor.command.execute({ command: new BatchCommand(dry.commands) });
+				toast.success(`Successfully applied ${dry.commands.length} edits.`);
+			} else {
+				throw new Error("Could not apply edits to the current clips.");
+			}
+		} catch (err: any) {
+			toast.error(err?.message || "Failed to commit timeline edits.");
+		} finally {
+			useEditorStore.getState().clearGhostClips();
+		}
 	};
 
-	const toggleEditCard = (id: string) => {
-		setEditingCardIds((prev) => ({ ...prev, [id]: !prev[id] }));
+	const handleRejectProposedEdits = () => {
+		useEditorStore.getState().clearGhostClips();
+		toast.info("Proposed edits discarded.");
+	};
+
+	const toggleExpandCard = (id: string) => {
+		setExpandedCardIds((prev) => ({ ...prev, [id]: !prev[id] }));
 	};
 
 	const getCategoryStyles = (category: string) => {
@@ -474,7 +717,7 @@ export function MimicTab() {
 	};
 
 	return (
-		<div className="flex h-full flex-col bg-background text-foreground p-4 select-none">
+		<div className="flex h-full flex-col bg-background text-foreground p-4 select-none relative">
 			{/* Segmented Header Controls */}
 			<div className="flex items-center gap-2 mb-4 justify-between border-b border-border pb-3">
 				<div className="flex items-center gap-2">
@@ -517,65 +760,225 @@ export function MimicTab() {
 				</div>
 			</div>
 
+			{/* Floating Timeline Review State Banner */}
+			{ghostClips.length > 0 && (
+				<div className="absolute bottom-4 left-4 right-4 bg-agent/10 border border-agent/30 rounded-xl p-3.5 space-y-2.5 shadow-2xl backdrop-blur-md z-50">
+					<div className="flex items-center gap-2 text-xs font-semibold text-agent">
+						<Activity className="size-4 animate-pulse" />
+						<span>Timeline Proposed Edits ({ghostClips.length})</span>
+					</div>
+					<p className="text-[10px] text-muted-foreground leading-normal">
+						Pending cuts and deleted clips are highlighted on the timeline. Hover/right-click elements to edit, or confirm:
+					</p>
+					<div className="flex gap-2">
+						<Button
+							onClick={handleConfirmProposedEdits}
+							className="flex-1 bg-agent hover:bg-agent/90 text-agent-foreground h-8 text-[11px] font-semibold rounded-lg gap-1.5"
+						>
+							<Check className="size-3.5" />
+							Apply Edits
+						</Button>
+						<Button
+							onClick={handleRejectProposedEdits}
+							variant="outline"
+							className="flex-1 bg-transparent hover:bg-card border-border text-foreground h-8 text-[11px] font-semibold rounded-lg gap-1.5"
+						>
+							<X className="size-3.5" />
+							Reject All
+						</Button>
+					</div>
+				</div>
+			)}
+
 			<ScrollArea className="flex-1 pr-1">
 				{activeTab === "presets" ? (
-					// --- PRESETS & CARDS VIEW ---
-					<div className="space-y-4">
-						{/* Paste link / notes card */}
+					// --- NOTEBOOKLM SOURCE HUB & PRESETS VIEW ---
+					<div className="space-y-4 pb-24">
+						{/* Source Ingestion (NotebookLM-style Source Hub) */}
 						<div className="bg-card/30 border border-border rounded-xl p-4 space-y-3">
 							<div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
-								<Youtube className="size-4 text-destructive" />
-								<span>Extract from Link or Describe Style</span>
+								<BookOpen className="size-4 text-agent" />
+								<span>Source Hub (NotebookLM)</span>
 							</div>
 
-							<div className="space-y-2">
+							{/* Add YouTube URL */}
+							<div className="flex gap-2">
 								<input
 									type="text"
-									value={urlInput}
-									onChange={(e) => setUrlInput(e.target.value)}
-									placeholder="Paste YouTube or video link..."
-									className="w-full bg-background border border-border rounded-lg px-3 py-2 text-xs text-foreground focus:outline-none focus:border-agent transition-all placeholder:text-muted-foreground/60"
+									value={newUrl}
+									onChange={(e) => setNewUrl(e.target.value)}
+									placeholder="Add Youtube video url..."
+									className="flex-1 bg-background border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground focus:outline-none focus:border-agent transition-all placeholder:text-muted-foreground/60"
 								/>
-								<textarea
-									value={descriptionInput}
-									onChange={(e) => setDescriptionInput(e.target.value)}
-									placeholder="Describe style (e.g. Warm cinematic travel look with slow cuts and vignettes)..."
-									rows={2}
-									className="w-full bg-background border border-border rounded-lg px-3 py-2 text-xs text-foreground focus:outline-none focus:border-agent transition-all resize-none placeholder:text-muted-foreground/60"
-								/>
+								<Button
+									onClick={handleAddYoutubeSource}
+									disabled={isAddingSource}
+									className="bg-card border border-border text-foreground hover:bg-accent text-[11px] h-8 px-3 font-semibold rounded-lg"
+								>
+									{isAddingSource ? <Activity className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+								</Button>
 							</div>
 
+							{/* Add Text Note Button */}
 							<Button
-								onClick={handleExtractRecipe}
-								disabled={isExtracting}
-								className="w-full bg-agent hover:bg-agent/90 text-agent-foreground py-2 h-9 rounded-lg font-medium text-xs gap-2 transition-all shadow-lg shadow-agent/20"
+								onClick={() => setShowAddTextModal(true)}
+								variant="outline"
+								className="w-full border border-border hover:bg-accent text-foreground text-[10px] h-7 gap-1.5"
 							>
-								{isExtracting ? (
-									<>
-										<Activity className="size-3.5 animate-spin" />
-										<span>Extracting style presets...</span>
-									</>
-								) : (
-									<>
-										<Sparkles className="size-3.5" />
-										<span>Extract Presets (.md)</span>
-									</>
-								)}
+								<Plus className="size-3.5" />
+								Add Text Note / Brief Source
 							</Button>
+
+							{/* Add Text Brief Inline Panel */}
+							{showAddTextModal && (
+								<div className="bg-background/80 border border-border/80 rounded-lg p-3 space-y-2.5">
+									<div className="flex items-center justify-between">
+										<span className="text-[10px] font-bold text-muted-foreground">Add Document Source</span>
+										<button
+											type="button"
+											onClick={() => setShowAddTextModal(false)}
+											className="text-muted-foreground hover:text-foreground cursor-pointer"
+										>
+											<X className="size-3.5" />
+										</button>
+									</div>
+									<input
+										type="text"
+										value={newTextName}
+										onChange={(e) => setNewTextName(e.target.value)}
+										placeholder="Document Name (e.g. Creative Brief)"
+										className="w-full bg-background border border-border rounded px-2 py-1 text-[11px] focus:outline-none focus:border-agent"
+									/>
+									<textarea
+										value={newTextContent}
+										onChange={(e) => setNewTextContent(e.target.value)}
+										placeholder="Paste creative brief content, video outlines, or transcripts here..."
+										rows={4}
+										className="w-full bg-background border border-border rounded px-2 py-1 text-[11px] focus:outline-none focus:border-agent resize-none"
+									/>
+									<Button
+										onClick={handleAddTextSource}
+										className="w-full bg-agent hover:bg-agent/90 text-agent-foreground text-[11px] h-7 font-semibold"
+									>
+										Save Source
+									</Button>
+								</div>
+							)}
+
+							{/* Ingested Sources List */}
+							{sources.length > 0 && (
+								<div className="space-y-2 pt-2 border-t border-border/60">
+									<span className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider block">
+										Ingested Materials
+									</span>
+									<div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+										{sources.map((src) => (
+											<div
+												key={src.id}
+												className="flex items-start gap-2 bg-background/50 border border-border/60 p-2.5 rounded-lg hover:bg-background/80 transition-colors"
+											>
+												<button
+													type="button"
+													onClick={() => handleToggleSource(src.id)}
+													className="mt-0.5 text-muted-foreground hover:text-foreground cursor-pointer"
+												>
+													{src.selected ? (
+														<CheckSquare className="size-4 text-agent" />
+													) : (
+														<Square className="size-4" />
+													)}
+												</button>
+												
+												<div className="flex-1 min-w-0">
+													<div className="flex items-center gap-1">
+														{src.type === "youtube" ? (
+															<Youtube className="size-3 text-destructive" />
+														) : (
+															<FileText className="size-3 text-agent" />
+														)}
+														<span className="text-[11px] font-semibold text-foreground truncate block max-w-[150px]">
+															{src.name}
+														</span>
+													</div>
+													<p className="text-[9px] text-muted-foreground line-clamp-2 mt-0.5">
+														{src.content}
+													</p>
+												</div>
+
+												<button
+													type="button"
+													onClick={() => handleDeleteSource(src.id)}
+													className="text-muted-foreground hover:text-destructive cursor-pointer p-0.5"
+												>
+													<Trash2 className="size-3.5" />
+												</button>
+											</div>
+										))}
+									</div>
+								</div>
+							)}
 						</div>
+
+						{/* Synthesis Query Bar */}
+						{sources.filter((s) => s.selected).length > 0 && (
+							<div className="bg-card/30 border border-border rounded-xl p-4 space-y-3">
+								<div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+									<Search className="size-4 text-agent" />
+									<span>Synthesize Sources (Copilot)</span>
+								</div>
+								
+								<textarea
+									value={synthesisPrompt}
+									onChange={(e) => setSynthesisPrompt(e.target.value)}
+									placeholder="Ask co-pilot to synthesize selected sources (e.g. 'Extract transitions from YT clip A and create a warm grading card based on brief B')..."
+									rows={3}
+									className="w-full bg-background border border-border rounded-lg px-3 py-2 text-xs text-foreground focus:outline-none focus:border-agent transition-all resize-none placeholder:text-muted-foreground/60 leading-normal"
+								/>
+
+								<Button
+									onClick={handleSynthesizeSources}
+									disabled={isSynthesizing}
+									className="w-full bg-agent hover:bg-agent/90 text-agent-foreground py-2 h-9 rounded-lg font-medium text-xs gap-2 transition-all shadow-lg shadow-agent/20"
+								>
+									{isSynthesizing ? (
+										<>
+											<Activity className="size-3.5 animate-spin" />
+											<span>Synthesizing documents...</span>
+										</>
+									) : (
+										<>
+											<Sparkles className="size-3.5" />
+											<span>Synthesize & Generate Cards</span>
+										</>
+									)}
+								</Button>
+							</div>
+						)}
+
+						{/* Synthesis Explanation Summary */}
+						{synthesisExplanation && (
+							<div className="bg-agent/5 border border-agent/20 p-3.5 rounded-xl space-y-2">
+								<div className="flex items-center gap-1.5 text-xs font-bold text-agent">
+									<FileText className="size-4" />
+									<span>Copilot Findings</span>
+								</div>
+								<p className="text-[10px] text-muted-foreground leading-relaxed whitespace-pre-line">
+									{synthesisExplanation}
+								</p>
+							</div>
+						)}
 
 						{/* Extracted Presets Board */}
 						{extractedCards.length > 0 && (
 							<div className="space-y-3">
 								<h3 className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider flex items-center gap-1.5">
 									<BookOpen className="size-3.5" />
-									Extracted Style Presets
+									Generated Style Presets
 								</h3>
 								<div className="space-y-3">
 									{extractedCards.map((card) => {
 										const cat = getCategoryStyles(card.category);
 										const isExpanded = expandedCardIds[card.id];
-										const isEditing = editingCardIds[card.id];
 										const targetType = cardTargetTypes[card.id] || "timeline";
 
 										return (
@@ -618,11 +1021,7 @@ export function MimicTab() {
 														type="button"
 														onClick={() => handleSaveCard(card)}
 														title="Save preset to library"
-														className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
-															card.saved
-																? "bg-agent/20 border-agent/30 text-agent"
-																: "bg-card hover:bg-accent border-border text-muted-foreground"
-														}`}
+														className="p-1.5 rounded-lg border transition-all cursor-pointer bg-card hover:bg-accent border-border text-muted-foreground"
 													>
 														<Save className="size-3.5" />
 													</button>
@@ -740,7 +1139,7 @@ export function MimicTab() {
 
 												{/* Apply Preset Action Button */}
 												<Button
-													onClick={() => handleApplyCard(card)}
+													onClick={() => handleApplyCardReview(card)}
 													disabled={applyingCardId !== null}
 													className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-8 text-[11px] font-semibold rounded-lg gap-1.5"
 												>
@@ -775,7 +1174,7 @@ export function MimicTab() {
 
 							{savedCards.length === 0 ? (
 								<p className="text-[10px] text-muted-foreground/60 italic pt-1">
-									No saved preset cards yet. Extract a style above, then save it to reuse later.
+									No saved preset cards yet. Ingest sources & synthesize style presets above.
 								</p>
 							) : (
 								<div className="space-y-3">
@@ -942,7 +1341,7 @@ export function MimicTab() {
 
 												{/* Apply Preset Action Button */}
 												<Button
-													onClick={() => handleApplyCard(card)}
+													onClick={() => handleApplyCardReview(card)}
 													disabled={applyingCardId !== null}
 													className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-8 text-[11px] font-semibold rounded-lg gap-1.5"
 												>
