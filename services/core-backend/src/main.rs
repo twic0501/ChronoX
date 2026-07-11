@@ -2129,7 +2129,11 @@ async fn agent_step_gemini(
                         let args = normalize_args(
                             tc.pointer("/function/arguments").cloned().unwrap_or_default(),
                         );
-                        parts.push(serde_json::json!({"functionCall": {"name": name, "args": args}}));
+                        let mut fc = serde_json::json!({"name": name, "args": args});
+                        if let Some(sig) = tc.get("thought_signature").or_else(|| tc.get("thoughtSignature")) {
+                            fc["thought_signature"] = sig.clone();
+                        }
+                        parts.push(serde_json::json!({"functionCall": fc}));
                     }
                 }
                 if parts.is_empty() {
@@ -2213,11 +2217,16 @@ async fn agent_step_gemini(
             if let Some(fc) = p.get("functionCall") {
                 let name = fc.get("name").cloned().unwrap_or_default();
                 let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
-                tool_calls.push(serde_json::json!({
+                let thought_signature = fc.get("thought_signature").or_else(|| fc.get("thoughtSignature")).cloned();
+                let mut tool_call = serde_json::json!({
                     "id": format!("call_{}", i),
                     "type": "function",
                     "function": {"name": name, "arguments": args}
-                }));
+                });
+                if let Some(sig) = thought_signature {
+                    tool_call["thought_signature"] = sig;
+                }
+                tool_calls.push(tool_call);
             }
         }
     }
