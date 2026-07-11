@@ -2190,6 +2190,10 @@ Input Reference Details: \
                 Err(e) => Err(e),
             }
         }
+        "ollama" | "local" => {
+            let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
+            agent_step_ollama(&model, &messages, &serde_json::json!([])).await
+        }
         _ => Err(format!("Unsupported provider: {}", provider)),
     };
 
@@ -2316,6 +2320,10 @@ Output the JSON block containing the operations: {{\"operations\": [...]}}. Only
                 }
                 Err(e) => Err(e),
             }
+        }
+        "ollama" | "local" => {
+            let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
+            agent_step_ollama(&model, &messages, &tools).await
         }
         _ => Err(format!("Unsupported provider: {}", provider)),
     };
