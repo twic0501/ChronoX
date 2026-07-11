@@ -296,6 +296,31 @@ export function TimelineElement({
 								? `translate3d(0, ${dragOffsetY}px, 0)`
 								: undefined,
 					}}
+					onDragOver={(e) => {
+						e.preventDefault();
+						e.dataTransfer.dropEffect = "copy";
+					}}
+					onDrop={(e) => {
+						e.preventDefault();
+						const dataStr = e.dataTransfer.getData("text/plain");
+						if (!dataStr) return;
+						try {
+							const payload = JSON.parse(dataStr);
+							if (payload.cardId && payload.recipeMd) {
+								const customEvent = new CustomEvent("apply-preset-to-target", {
+									detail: {
+										cardId: payload.cardId,
+										recipeMd: payload.recipeMd,
+										targetType: "selected",
+										targetClipId: element.id,
+									}
+								});
+								window.dispatchEvent(customEvent);
+							}
+						} catch (err) {
+							console.error("Drop parsing failed:", err);
+						}
+					}}
 				>
 					<ElementInner
 						element={element}

@@ -2376,7 +2376,13 @@ async fn extract_recipe_handler(
     let prompt = format!(
         "You are an expert video editing and colorist consultant. \
 Based on the following reference details and visual frame/color metadata (Mixpeek Extractor), analyze the style, and output a JSON object containing a list of modular preset cards (StyleCards). \
-Each StyleCard represents a specific, independent aspect of the style (e.g. a specific color grading look, transitions kit, pacing rules, or visual effects). \
+You MUST generate high-quality cards. Avoid generic descriptions. Each card must belong to one of these categories: \
+1. 'color': Color grading, HSL values, temperature, contrast, vignette, or lookup tables (LUTs). Must be precise (e.g. specify HSL hue shifts, lift/gamma/gain ranges, or color curves). \
+2. 'transitions': Transition kits, whip pan, blur dissolve, crossfade durations (in frames or seconds), or J-cut/L-cut specifications. \
+3. 'pacing': Editing tempo, speed ramping, shot duration rhythm (e.g., fast cuts under 1.5s for action, long takes > 5s for dialogue), and beat-syncing. \
+4. 'effects': Crop ratios, grain, lens distortion, overlays, or animations. \
+You MUST generate at least one 'color' card, one 'transitions' card, and one 'pacing' card. Do NOT group everything into 'effects'. \
+Each StyleCard represents a specific, independent aspect of the style. \
 If the reference has different visual looks/grades in different scenes (which you can identify from the Scene Breakdown in the Visual Ingest Profile below), you MUST split them into separate 'color' category cards, each with its corresponding 'time_range' bounds (in seconds, e.g. [0.0, 10.0] or [10.0, 25.0]). Otherwise, set 'time_range' to null. \
 You MUST format the output as a JSON object matching this schema: \
 {{ \
@@ -2951,11 +2957,14 @@ async fn agent_step_gemini(
                         let args = normalize_args(
                             tc.pointer("/function/arguments").cloned().unwrap_or_default(),
                         );
-                        let mut fc = serde_json::json!({"name": name, "args": args});
+                        let mut part = serde_json::json!({
+                            "functionCall": {"name": name, "args": args}
+                        });
                         if let Some(sig) = tc.get("thought_signature").or_else(|| tc.get("thoughtSignature")) {
-                            fc["thought_signature"] = sig.clone();
+                            part["thought_signature"] = sig.clone();
+                            part["thoughtSignature"] = sig.clone();
                         }
-                        parts.push(serde_json::json!({"functionCall": fc}));
+                        parts.push(part);
                     }
                 }
                 if parts.is_empty() {
@@ -2966,9 +2975,44 @@ async fn agent_step_gemini(
             "tool" => {
                 let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                 let content = m.get("content").cloned().unwrap_or_default();
+                let tool_call_id = m.get("tool_call_id").and_then(|id| id.as_str()).unwrap_or("");
+                
+                // Find matching thought_signature from conversation history
+                let mut found_signature = None;
+                for prev in msgs {
+                    if prev.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        if let Some(tcs) = prev.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tcs {
+                                let tc_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                let tc_name = tc.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
+                                if (tc_id == tool_call_id && !tool_call_id.is_empty()) || (tc_name == name && tool_call_id.is_empty()) {
+                                    if let Some(sig) = tc.get("thought_signature").or_else(|| tc.get("thoughtSignature")) {
+                                        found_signature = Some(sig.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found_signature.is_some() {
+                        break;
+                    }
+                }
+
+                let mut part = serde_json::json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": {"result": content}
+                    }
+                });
+                if let Some(sig) = found_signature {
+                    part["thought_signature"] = sig.clone();
+                    part["thoughtSignature"] = sig;
+                }
+
                 contents.push(serde_json::json!({
                     "role": "user",
-                    "parts": [{"functionResponse": {"name": name, "response": {"result": content}}}]
+                    "parts": [part]
                 }));
             }
             _ => {}
@@ -3039,7 +3083,11 @@ async fn agent_step_gemini(
             if let Some(fc) = p.get("functionCall") {
                 let name = fc.get("name").cloned().unwrap_or_default();
                 let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
-                let thought_signature = fc.get("thought_signature").or_else(|| fc.get("thoughtSignature")).cloned();
+                let thought_signature = p.get("thought_signature")
+                    .or_else(|| p.get("thoughtSignature"))
+                    .or_else(|| fc.get("thought_signature"))
+                    .or_else(|| fc.get("thoughtSignature"))
+                    .cloned();
                 let mut tool_call = serde_json::json!({
                     "id": format!("call_{}", i),
                     "type": "function",

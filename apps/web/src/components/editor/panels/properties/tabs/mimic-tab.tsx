@@ -37,6 +37,7 @@ import {
 	ChevronUp,
 	BookOpen,
 	Image,
+	Settings,
 } from "lucide-react";
 
 export function MimicTab() {
@@ -70,6 +71,24 @@ export function MimicTab() {
 	useEffect(() => {
 		setSavedCards(listStyleCards());
 	}, []);
+
+	// Handle Drag & Drop Preset Application Events
+	useEffect(() => {
+		const handleApplyTargetEvent = (e: Event) => {
+			const detail = (e as CustomEvent).detail;
+			if (detail && detail.recipeMd && detail.cardId) {
+				const card = listStyleCards().find((c) => c.id === detail.cardId) || 
+				             extractedCards.find((c) => c.id === detail.cardId);
+				if (card) {
+					handleApplyCardReview(card, detail.targetType, detail.targetClipId);
+				}
+			}
+		};
+		window.addEventListener("apply-preset-to-target", handleApplyTargetEvent);
+		return () => {
+			window.removeEventListener("apply-preset-to-target", handleApplyTargetEvent);
+		};
+	}, [extractedCards]);
 
 	// Auto-update backend timeline cache when tracks change
 	useEffect(() => {
@@ -221,16 +240,20 @@ export function MimicTab() {
 	};
 
 	// --- 4. Interactive Review Mode Application ---
-	const handleApplyCardReview = async (card: StyleCard) => {
+	const handleApplyCardReview = async (
+		card: StyleCard,
+		overrideTargetType?: "timeline" | "selected" | "range",
+		overrideClipId?: string
+	) => {
 		const aiCfg = getAiCfg();
 		const timelineState = buildTimelineSnapshot(editor);
 		const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
 		const recipeText = cardRecipes[card.id] || card.recipeMd;
-		const targetType = cardTargetTypes[card.id] || "timeline";
+		const targetType = overrideTargetType || cardTargetTypes[card.id] || "timeline";
 		
-		let targetClipId: string | undefined = undefined;
-		if (targetType === "selected") {
+		let targetClipId: string | undefined = overrideClipId;
+		if (targetType === "selected" && !targetClipId) {
 			if (selectedElements.length === 0) {
 				toast.error("Please select a clip on the timeline first.");
 				return;
@@ -648,177 +671,156 @@ export function MimicTab() {
 									return (
 										<div
 											key={card.id}
-											className={`border rounded-xl p-3.5 space-y-3 transition-all ${cat.cardClass}`}
+											draggable
+											onDragStart={(e) => {
+												e.dataTransfer.setData("text/plain", JSON.stringify({ cardId: card.id, recipeMd: card.recipeMd, targetType: "selected" }));
+												e.dataTransfer.effectAllowed = "copy";
+											}}
+											className={`flex flex-col border rounded-lg p-2.5 transition-all cursor-grab active:cursor-grabbing ${cat.cardClass} relative group hover:border-agent/60 shadow-sm`}
 										>
-											<div className="flex items-start gap-2.5 justify-between">
-												<div className="flex-1 min-w-0">
-													<div className="flex items-center gap-1.5 flex-wrap mb-1">
-														<span
-															className={`px-1.5 py-0.5 rounded border text-[9px] font-semibold flex items-center gap-1 ${cat.badge}`}
-														>
-															{cat.icon}
-															{cat.label}
-														</span>
-														{card.timeRange && (
-															<span className="bg-card border border-border px-1.5 py-0.5 rounded text-[9px] font-mono text-muted-foreground">
-																Range: {card.timeRange[0]}s - {card.timeRange[1]}s
-															</span>
-														)}
+											<div className="flex items-center gap-2 justify-between">
+												<div className="flex items-center gap-1.5 min-w-0 flex-1">
+													<div className={`p-1 rounded text-xs shrink-0 ${cat.badge}`}>
+														{cat.icon}
 													</div>
-													<input
-														type="text"
-														value={cardNames[card.id] ?? card.name}
-														onChange={(e) =>
-															setCardNames((prev) => ({
-																...prev,
-																[card.id]: e.target.value,
-															}))
-														}
-														className="text-xs font-bold text-foreground bg-transparent border-b border-transparent hover:border-border/40 focus:border-agent focus:outline-none w-full py-0.5"
-													/>
-													<p className="text-[10px] text-muted-foreground mt-0.5 leading-relaxed">
-														{card.summary}
-													</p>
+													<div className="min-w-0 flex-1">
+														<span className="text-[11px] font-bold text-foreground truncate block">
+															{cardNames[card.id] ?? card.name}
+														</span>
+														<span className="text-[9px] text-muted-foreground truncate block">
+															{card.summary || "Drag to clip to apply"}
+														</span>
+													</div>
 												</div>
-
-												<button
-													type="button"
-													onClick={() => handleSaveCard(card)}
-													title="Save preset to library"
-													className="p-1.5 rounded-lg border transition-all cursor-pointer bg-card hover:bg-accent border-border text-muted-foreground"
-												>
-													<Save className="size-3.5" />
-												</button>
+												
+												<div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
+													<button
+														type="button"
+														onClick={() => toggleExpandCard(card.id)}
+														className="p-1 rounded hover:bg-card text-muted-foreground hover:text-foreground"
+														title="Configure preset"
+													>
+														<Settings className="size-3" />
+													</button>
+													<button
+														type="button"
+														onClick={() => handleSaveCard(card)}
+														className="p-1 rounded hover:bg-primary/15 text-muted-foreground hover:text-primary"
+														title="Save preset"
+													>
+														<Save className="size-3" />
+													</button>
+												</div>
 											</div>
 
-											{/* Collapsible Recipe Code block */}
-											<div className="border border-border/80 bg-background/50 rounded-lg overflow-hidden">
-												<button
-													type="button"
-													onClick={() => toggleExpandCard(card.id)}
-													className="w-full flex items-center justify-between px-3 py-2 text-[10px] font-medium text-muted-foreground hover:bg-card/30 transition-colors cursor-pointer"
-												>
-													<span className="flex items-center gap-1.5">
-														<FileText className="size-3.5" />
-														Markdown Instructions (.md)
-													</span>
-													{isExpanded ? (
-														<ChevronUp className="size-3.5" />
-													) : (
-														<ChevronDown className="size-3.5" />
-													)}
-												</button>
+											<div className="hidden group-hover:flex absolute -top-2.5 left-1/2 -translate-x-1/2 bg-agent text-white text-[8px] px-1.5 py-0.5 rounded-full font-semibold pointer-events-none shadow z-50">
+												Drag to Timeline
+											</div>
 
-												{isExpanded && (
-													<div className="p-2 border-t border-border/80 bg-background">
-														<textarea
-															value={cardRecipes[card.id] ?? card.recipeMd}
-															onChange={(e) =>
-																setCardRecipes((prev) => ({
-																	...prev,
-																	[card.id]: e.target.value,
-																}))
-															}
-															rows={6}
-															className="w-full bg-background border border-border/60 rounded px-2.5 py-1.5 text-[10px] font-mono text-foreground focus:outline-none focus:border-agent resize-y leading-normal"
+											{isExpanded && (
+												<div className="mt-2 pt-2 border-t border-border/40 space-y-2 text-[10px]">
+													<div className="space-y-1">
+														<label className="text-[9px] uppercase font-bold text-muted-foreground block">Preset Name</label>
+														<input
+															type="text"
+															value={cardNames[card.id] ?? card.name}
+															onChange={(e) => {
+																const newName = e.target.value;
+																setCardNames((prev) => ({ ...prev, [card.id]: newName }));
+															}}
+															className="w-full bg-background border border-border rounded px-2 py-1 text-[10px] focus:outline-none focus:border-agent"
 														/>
 													</div>
-												)}
-											</div>
 
-											{/* Target Range Selector */}
-											<div className="grid grid-cols-2 gap-2 bg-background/30 p-2.5 rounded-lg border border-border/60">
-												<div className="space-y-1">
-													<span className="text-[9px] uppercase font-bold text-muted-foreground">
-														Apply Target
-													</span>
-													<select
-														value={targetType}
-														onChange={(e: any) =>
-															setCardTargetTypes((prev) => ({
-																...prev,
-																[card.id]: e.target.value,
-															}))
-														}
-														className="w-full bg-card border border-border rounded px-2 py-1 text-[10px] text-foreground focus:outline-none focus:border-agent"
-													>
-														<option value="timeline">Entire Timeline</option>
-														<option value="selected">Selected Clip</option>
-														<option value="range">Custom Range</option>
-													</select>
-												</div>
+													<div className="space-y-1">
+														<label className="text-[9px] uppercase font-bold text-muted-foreground block">Recipe Markdown</label>
+														<textarea
+															value={cardRecipes[card.id] ?? card.recipeMd}
+															onChange={(e) => {
+																const newRecipe = e.target.value;
+																setCardRecipes((prev) => ({ ...prev, [card.id]: newRecipe }));
+															}}
+															rows={4}
+															className="w-full bg-background border border-border rounded px-2 py-1 font-mono text-[9px] focus:outline-none focus:border-agent resize-y"
+														/>
+													</div>
 
-												<div className="space-y-1 flex flex-col justify-end">
-													{targetType === "range" ? (
-														<div className="flex gap-1.5 items-center">
-															<input
-																type="number"
-																placeholder="Start"
-																value={cardCustomRanges[card.id]?.start ?? card.timeRange?.[0] ?? "0"}
-																onChange={(e) =>
-																	setCardCustomRanges((prev) => ({
+													<div className="grid grid-cols-2 gap-2 bg-background/20 p-2 rounded-lg border border-border/40">
+														<div className="space-y-1">
+															<label className="text-[9px] uppercase font-bold text-muted-foreground block">Apply Target</label>
+															<select
+																value={targetType}
+																onChange={(e: any) =>
+																	setCardTargetTypes((prev) => ({
 																		...prev,
-																		[card.id]: {
-																			start: e.target.value,
-																			end:
-																				prev[card.id]?.end ??
-																				String(card.timeRange?.[1] ?? "10"),
-																		},
+																		[card.id]: e.target.value,
 																	}))
 																}
-																className="w-full bg-card border border-border rounded px-1.5 py-1 text-[10px] text-center focus:outline-none focus:border-agent font-mono"
-															/>
-															<span className="text-[10px] text-muted-foreground">to</span>
-															<input
-																type="number"
-																placeholder="End"
-																value={cardCustomRanges[card.id]?.end ?? card.timeRange?.[1] ?? "10"}
-																onChange={(e) =>
-																	setCardCustomRanges((prev) => ({
-																		...prev,
-																		[card.id]: {
-																			start:
-																				prev[card.id]?.start ??
-																				String(card.timeRange?.[0] ?? "0"),
-																			end: e.target.value,
-																		},
-																	}))
-																}
-																className="w-full bg-card border border-border rounded px-1.5 py-1 text-[10px] text-center focus:outline-none focus:border-agent font-mono"
-															/>
+																className="w-full bg-card border border-border rounded px-1.5 py-0.5 text-[9px] text-foreground focus:outline-none focus:border-agent"
+															>
+																<option value="timeline">Entire Timeline</option>
+																<option value="selected">Selected Clip</option>
+																<option value="range">Custom Range</option>
+															</select>
 														</div>
-													) : targetType === "selected" ? (
-														<span className="text-[10px] text-muted-foreground italic h-7 flex items-center leading-tight">
-															{selectedElements.length > 0
-																? `Targeting clip "${selectedElementName}"`
-																: "Select clip on timeline"}
-														</span>
-													) : (
-														<span className="text-[10px] text-muted-foreground italic h-7 flex items-center">
-															Global timeline target
-														</span>
+
+														<div className="space-y-1 flex flex-col justify-end">
+															{targetType === "range" ? (
+																<div className="flex gap-1 items-center">
+																	<input
+																		type="number"
+																		placeholder="Start"
+																		value={cardCustomRanges[card.id]?.start ?? card.timeRange?.[0] ?? "0"}
+																		onChange={(e) =>
+																			setCardCustomRanges((prev) => ({
+																				...prev,
+																				[card.id]: {
+																					start: e.target.value,
+																					end: prev[card.id]?.end ?? String(card.timeRange?.[1] ?? "10"),
+																				},
+																			}))
+																		}
+																		className="w-full bg-card border border-border rounded px-1 py-0.5 text-[9px] text-center font-mono"
+																	/>
+																	<span className="text-[9px] text-muted-foreground">to</span>
+																	<input
+																		type="number"
+																		placeholder="End"
+																		value={cardCustomRanges[card.id]?.end ?? card.timeRange?.[1] ?? "10"}
+																		onChange={(e) =>
+																			setCardCustomRanges((prev) => ({
+																				...prev,
+																				[card.id]: {
+																					start: prev[card.id]?.start ?? String(card.timeRange?.[0] ?? "0"),
+																					end: e.target.value,
+																				},
+																			}))
+																		}
+																		className="w-full bg-card border border-border rounded px-1 py-0.5 text-[9px] text-center font-mono"
+																	/>
+																</div>
+															) : (
+																<button
+																	onClick={() => handleApplyCardReview(card)}
+																	disabled={applyingCardId !== null}
+																	className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-6 text-[9px] font-semibold rounded gap-1 flex items-center justify-center"
+																>
+																	<Wand2 className="size-2.5" /> Apply
+																</button>
+															)}
+														</div>
+													</div>
+													{targetType === "range" && (
+														<button
+															onClick={() => handleApplyCardReview(card)}
+															disabled={applyingCardId !== null}
+															className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-6 text-[9px] font-semibold rounded gap-1 flex items-center justify-center mt-1"
+														>
+															<Wand2 className="size-2.5" /> Apply to Custom Range
+														</button>
 													)}
 												</div>
-											</div>
-
-											{/* Apply Preset Action Button */}
-											<Button
-												onClick={() => handleApplyCardReview(card)}
-												disabled={applyingCardId !== null}
-												className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-8 text-[11px] font-semibold rounded-lg gap-1.5"
-											>
-												{applyingCardId === card.id ? (
-													<>
-														<Activity className="size-3.5 animate-spin" />
-														Translating parameters…
-													</>
-												) : (
-													<>
-														<Wand2 className="size-3.5" />
-														Apply Preset Card
-													</>
-												)}
-											</Button>
+											)}
 										</div>
 									);
 								})}
@@ -885,179 +887,162 @@ export function MimicTab() {
 
 										return (
 											<div
-											key={card.id}
-											className={`border rounded-xl p-3.5 space-y-3 transition-all ${cat.cardClass}`}
-										>
-											<div className="flex items-start gap-2.5 justify-between">
-												<div className="flex-1 min-w-0">
-													<div className="flex items-center gap-1.5 flex-wrap mb-1">
-														<span
-															className={`px-1.5 py-0.5 rounded border text-[9px] font-semibold flex items-center gap-1 ${cat.badge}`}
-														>
+												key={card.id}
+												draggable
+												onDragStart={(e) => {
+													e.dataTransfer.setData("text/plain", JSON.stringify({ cardId: card.id, recipeMd: card.recipeMd, targetType: "selected" }));
+													e.dataTransfer.effectAllowed = "copy";
+												}}
+												className={`flex flex-col border rounded-lg p-2.5 transition-all cursor-grab active:cursor-grabbing ${cat.cardClass} relative group hover:border-agent/60 shadow-sm`}
+											>
+												<div className="flex items-center gap-2 justify-between">
+													<div className="flex items-center gap-1.5 min-w-0 flex-1">
+														<div className={`p-1 rounded text-xs shrink-0 ${cat.badge}`}>
 															{cat.icon}
-															{cat.label}
-														</span>
-														{card.timeRange && (
-															<span className="bg-card border border-border px-1.5 py-0.5 rounded text-[9px] font-mono text-muted-foreground">
-																Range: {card.timeRange[0]}s - {card.timeRange[1]}s
+														</div>
+														<div className="min-w-0 flex-1">
+															<span className="text-[11px] font-bold text-foreground truncate block">
+																{cardNames[card.id] ?? card.name}
 															</span>
-														)}
+															<span className="text-[9px] text-muted-foreground truncate block">
+																{card.summary || "Drag to clip to apply"}
+															</span>
+														</div>
 													</div>
-													<input
-														type="text"
-														value={cardNames[card.id] ?? card.name}
-														onChange={(e) => {
-															const newName = e.target.value;
-															setCardNames((prev) => ({ ...prev, [card.id]: newName }));
-															saveStyleCard({ ...card, name: newName });
-															setSavedCards(listStyleCards());
-														}}
-														className="text-xs font-bold text-foreground bg-transparent border-b border-transparent hover:border-border/40 focus:border-agent focus:outline-none w-full py-0.5"
-													/>
-													<p className="text-[10px] text-muted-foreground leading-normal mt-0.5">
-														{card.summary}
-													</p>
+													
+													<div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
+														<button
+															type="button"
+															onClick={() => toggleExpandCard(card.id)}
+															className="p-1 rounded hover:bg-card text-muted-foreground hover:text-foreground"
+															title="Configure preset"
+														>
+															<Settings className="size-3" />
+														</button>
+														<button
+															type="button"
+															onClick={() => handleDeleteCard(card)}
+															className="p-1 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive"
+															title="Delete preset"
+														>
+															<Trash2 className="size-3" />
+														</button>
+													</div>
 												</div>
 
-												<button
-													type="button"
-													onClick={() => handleDeleteCard(card)}
-													title="Delete preset"
-													className="p-1 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-colors cursor-pointer"
-												>
-													<Trash2 className="size-3.5" />
-												</button>
-											</div>
-
-											{/* Collapse Recipe view */}
-											<div className="border border-border/60 bg-background/30 rounded-lg overflow-hidden">
-												<button
-													type="button"
-													onClick={() => toggleExpandCard(card.id)}
-													className="w-full flex items-center justify-between px-3 py-1.5 text-[10px] font-medium text-muted-foreground hover:bg-card/20 transition-colors cursor-pointer"
-												>
-													<span className="flex items-center gap-1.5">
-														<FileText className="size-3.5" />
-														Markdown Instructions (.md)
-													</span>
-													{isExpanded ? (
-														<ChevronUp className="size-3.5" />
-													) : (
-														<ChevronDown className="size-3.5" />
-													)}
-												</button>
+												<div className="hidden group-hover:flex absolute -top-2.5 left-1/2 -translate-x-1/2 bg-agent text-white text-[8px] px-1.5 py-0.5 rounded-full font-semibold pointer-events-none shadow z-50">
+													Drag to Timeline
+												</div>
 
 												{isExpanded && (
-													<div className="p-2 border-t border-border/60 bg-background">
-														<textarea
-															value={cardRecipes[card.id] ?? card.recipeMd}
-															onChange={(e) => {
-																const newRecipe = e.target.value;
-																setCardRecipes((prev) => ({ ...prev, [card.id]: newRecipe }));
-																saveStyleCard({ ...card, recipeMd: newRecipe });
-																setSavedCards(listStyleCards());
-															}}
-															rows={6}
-															className="w-full bg-background border border-border/60 rounded px-2.5 py-1.5 text-[10px] font-mono text-foreground focus:outline-none focus:border-agent resize-y leading-normal"
-														/>
+													<div className="mt-2 pt-2 border-t border-border/40 space-y-2 text-[10px]">
+														<div className="space-y-1">
+															<label className="text-[9px] uppercase font-bold text-muted-foreground block">Preset Name</label>
+															<input
+																type="text"
+																value={cardNames[card.id] ?? card.name}
+																onChange={(e) => {
+																	const newName = e.target.value;
+																	setCardNames((prev) => ({ ...prev, [card.id]: newName }));
+																	saveStyleCard({ ...card, name: newName });
+																	setSavedCards(listStyleCards());
+																}}
+																className="w-full bg-background border border-border rounded px-2 py-1 text-[10px] focus:outline-none focus:border-agent"
+															/>
+														</div>
+
+														<div className="space-y-1">
+															<label className="text-[9px] uppercase font-bold text-muted-foreground block">Recipe Markdown</label>
+															<textarea
+																value={cardRecipes[card.id] ?? card.recipeMd}
+																onChange={(e) => {
+																	const newRecipe = e.target.value;
+																	setCardRecipes((prev) => ({ ...prev, [card.id]: newRecipe }));
+																	saveStyleCard({ ...card, recipeMd: newRecipe });
+																	setSavedCards(listStyleCards());
+																}}
+																rows={4}
+																className="w-full bg-background border border-border rounded px-2 py-1 font-mono text-[9px] focus:outline-none focus:border-agent resize-y"
+															/>
+														</div>
+
+														<div className="grid grid-cols-2 gap-2 bg-background/20 p-2 rounded-lg border border-border/40">
+															<div className="space-y-1">
+																<label className="text-[9px] uppercase font-bold text-muted-foreground block">Apply Target</label>
+																<select
+																	value={targetType}
+																	onChange={(e: any) =>
+																		setCardTargetTypes((prev) => ({
+																			...prev,
+																			[card.id]: e.target.value,
+																			}))
+																	}
+																	className="w-full bg-card border border-border rounded px-1.5 py-0.5 text-[9px] text-foreground focus:outline-none focus:border-agent"
+																>
+																	<option value="timeline">Entire Timeline</option>
+																	<option value="selected">Selected Clip</option>
+																	<option value="range">Custom Range</option>
+																</select>
+															</div>
+
+															<div className="space-y-1 flex flex-col justify-end">
+																{targetType === "range" ? (
+																	<div className="flex gap-1 items-center">
+																		<input
+																			type="number"
+																			placeholder="Start"
+																			value={cardCustomRanges[card.id]?.start ?? card.timeRange?.[0] ?? "0"}
+																			onChange={(e) =>
+																				setCardCustomRanges((prev) => ({
+																					...prev,
+																					[card.id]: {
+																						start: e.target.value,
+																						end: prev[card.id]?.end ?? String(card.timeRange?.[1] ?? "10"),
+																					},
+																				}))
+																			}
+																			className="w-full bg-card border border-border rounded px-1 py-0.5 text-[9px] text-center font-mono"
+																		/>
+																		<span className="text-[9px] text-muted-foreground">to</span>
+																		<input
+																			type="number"
+																			placeholder="End"
+																			value={cardCustomRanges[card.id]?.end ?? card.timeRange?.[1] ?? "10"}
+																			onChange={(e) =>
+																				setCardCustomRanges((prev) => ({
+																					...prev,
+																					[card.id]: {
+																						start: prev[card.id]?.start ?? String(card.timeRange?.[0] ?? "0"),
+																						end: e.target.value,
+																					},
+																				}))
+																			}
+																			className="w-full bg-card border border-border rounded px-1 py-0.5 text-[9px] text-center font-mono"
+																		/>
+																	</div>
+																) : (
+																	<button
+																		onClick={() => handleApplyCardReview(card)}
+																		disabled={applyingCardId !== null}
+																		className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-6 text-[9px] font-semibold rounded gap-1 flex items-center justify-center"
+																	>
+																		<Wand2 className="size-2.5" /> Apply
+																	</button>
+																)}
+															</div>
+														</div>
+														{targetType === "range" && (
+															<button
+																onClick={() => handleApplyCardReview(card)}
+																disabled={applyingCardId !== null}
+																className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-6 text-[9px] font-semibold rounded gap-1 flex items-center justify-center mt-1"
+															>
+																<Wand2 className="size-2.5" /> Apply to Custom Range
+															</button>
+														)}
 													</div>
 												)}
 											</div>
-
-											{/* Target Range Selector */}
-											<div className="grid grid-cols-2 gap-2 bg-background/20 p-2.5 rounded-lg border border-border/60">
-												<div className="space-y-1">
-													<span className="text-[9px] uppercase font-bold text-muted-foreground">
-														Apply Target
-													</span>
-													<select
-														value={targetType}
-														onChange={(e: any) =>
-															setCardTargetTypes((prev) => ({
-																...prev,
-																[card.id]: e.target.value,
-															}))
-														}
-														className="w-full bg-card border border-border rounded px-2 py-1 text-[10px] text-foreground focus:outline-none focus:border-agent"
-													>
-														<option value="timeline">Entire Timeline</option>
-														<option value="selected">Selected Clip</option>
-														<option value="range">Custom Range</option>
-													</select>
-												</div>
-
-												<div className="space-y-1 flex flex-col justify-end">
-													{targetType === "range" ? (
-														<div className="flex gap-1.5 items-center">
-															<input
-																type="number"
-																placeholder="Start"
-																value={cardCustomRanges[card.id]?.start ?? card.timeRange?.[0] ?? "0"}
-																onChange={(e) =>
-																	setCardCustomRanges((prev) => ({
-																		...prev,
-																		[card.id]: {
-																			start: e.target.value,
-																			end:
-																				prev[card.id]?.end ??
-																				String(card.timeRange?.[1] ?? "10"),
-																		},
-																	}))
-																}
-																className="w-full bg-card border border-border rounded px-1.5 py-1 text-[10px] text-center focus:outline-none focus:border-agent font-mono"
-															/>
-															<span className="text-[10px] text-muted-foreground">to</span>
-															<input
-																type="number"
-																placeholder="End"
-																value={cardCustomRanges[card.id]?.end ?? card.timeRange?.[1] ?? "10"}
-																onChange={(e) =>
-																	setCardCustomRanges((prev) => ({
-																		...prev,
-																		[card.id]: {
-																			start:
-																				prev[card.id]?.start ??
-																				String(card.timeRange?.[0] ?? "0"),
-																			end: e.target.value,
-																		},
-																	}))
-																}
-																className="w-full bg-card border border-border rounded px-1.5 py-1 text-[10px] text-center focus:outline-none focus:border-agent font-mono"
-															/>
-														</div>
-													) : targetType === "selected" ? (
-														<span className="text-[10px] text-muted-foreground italic h-7 flex items-center leading-tight">
-															{selectedElements.length > 0
-																? `Targeting clip "${selectedElementName}"`
-																: "Select clip on timeline"}
-														</span>
-													) : (
-														<span className="text-[10px] text-muted-foreground italic h-7 flex items-center">
-															Global timeline target
-														</span>
-													)}
-												</div>
-											</div>
-
-											{/* Apply Preset Action Button */}
-											<Button
-												onClick={() => handleApplyCardReview(card)}
-												disabled={applyingCardId !== null}
-												className="w-full bg-agent/15 hover:bg-agent/25 text-agent border border-agent/30 h-8 text-[11px] font-semibold rounded-lg gap-1.5"
-											>
-												{applyingCardId === card.id ? (
-													<>
-														<Activity className="size-3.5 animate-spin" />
-														Translating parameters…
-													</>
-												) : (
-													<>
-														<Wand2 className="size-3.5" />
-														Apply Preset Card
-													</>
-												)}
-											</Button>
-										</div>
 									);
 								})}
 							</div>

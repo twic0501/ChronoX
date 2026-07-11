@@ -160,7 +160,7 @@ export function TimelineTrackContent({
 							<div
 								key={clip.id}
 								onContextMenu={handleRemove}
-								className="absolute top-0.5 bottom-0.5 bg-destructive/20 hover:bg-destructive/30 border border-dashed border-destructive/60 hover:border-destructive/80 rounded-sm z-30 flex items-center justify-center text-[9px] text-destructive-foreground font-medium select-none px-2 text-center group cursor-pointer"
+								className="absolute top-0.5 bottom-0.5 bg-destructive/5 hover:bg-destructive/10 border-2 border-dashed border-destructive/40 hover:border-destructive/60 rounded-sm z-30 flex items-center justify-center text-[9px] text-destructive font-bold select-none px-2 text-center group cursor-pointer"
 								style={{
 									left: `${left}px`,
 									width: `${width}px`,
@@ -182,17 +182,17 @@ export function TimelineTrackContent({
 						<div
 							key={clip.id}
 							onContextMenu={handleRemove}
-							className="absolute top-0.5 bottom-0.5 bg-agent/10 hover:bg-agent/20 border border-dashed border-agent/70 hover:border-agent/90 rounded-sm z-30 flex items-center justify-center text-[9px] text-agent font-medium select-none px-2 text-center group cursor-pointer"
+							className="absolute top-1 h-5 bg-card/95 hover:bg-card border border-agent/50 hover:border-agent text-agent rounded-full z-30 flex items-center justify-center text-[8px] font-bold select-none px-2.5 shadow-sm group cursor-pointer"
 							style={{
 								left: `${left}px`,
 								width: `${width}px`,
 							}}
 						>
-							<span>{clip.label}</span>
+							<span className="truncate max-w-full">{clip.label}</span>
 							<button
 								type="button"
 								onClick={handleRemove}
-								className="absolute top-0.5 right-0.5 size-3.5 bg-agent/60 hover:bg-agent text-white rounded-full items-center justify-center hidden group-hover:flex text-[8px] font-bold cursor-pointer"
+								className="ml-1.5 size-3 bg-agent/60 hover:bg-agent text-white rounded-full items-center justify-center hidden group-hover:flex text-[7px] font-bold cursor-pointer"
 							>
 								✕
 							</button>
