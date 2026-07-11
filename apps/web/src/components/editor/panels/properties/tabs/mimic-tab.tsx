@@ -65,6 +65,18 @@ export function MimicTab() {
 		setSavedCards(listStyleCards());
 	}, []);
 
+	// Auto-update backend timeline cache when tracks change
+	useEffect(() => {
+		if (editor && editor.websocket) {
+			try {
+				const snapshot = buildTimelineSnapshot(editor);
+				editor.websocket.sendMessage("UPDATE_TIMELINE_SNAPSHOT", { snapshot });
+			} catch (e) {
+				console.error("Failed to push timeline snapshot to backend:", e);
+			}
+		}
+	}, [tracks, editor]);
+
 	const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
 		const file = e.target.files?.[0];
 		if (file) {

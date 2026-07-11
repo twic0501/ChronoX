@@ -23,6 +23,8 @@ use tower_http::cors::CorsLayer;
 struct AppState {
     db: Arc<Mutex<Connection>>,
     db_tx: tokio::sync::mpsc::Sender<DbCommand>,
+    mcp_tx: tokio::sync::broadcast::Sender<String>,
+    timeline_cache: Arc<std::sync::RwLock<String>>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -181,9 +183,14 @@ async fn main() {
         }
     });
 
+    let (mcp_tx, _) = tokio::sync::broadcast::channel::<String>(100);
+    let timeline_cache = Arc::new(std::sync::RwLock::new("Empty timeline — no clips added.".to_string()));
+
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
         db_tx,
+        mcp_tx,
+        timeline_cache,
     };
 
     let cors = CorsLayer::new()
@@ -220,6 +227,8 @@ async fn main() {
         .route("/api/ai/extract-recipe", post(extract_recipe_handler))
         .route("/api/ai/apply-recipe", post(apply_recipe_handler))
         .route("/api/ai/synthesize-sources", post(synthesize_sources_handler))
+        .route("/api/mcp/timeline", get(mcp_timeline_handler))
+        .route("/api/mcp/execute", post(mcp_execute_handler))
         .route("/api/project/export", post(export_project_handler))
         .route("/api/ai/mimic-flow", post(ai_mimic_flow_handler))
         .route("/api/ai/scene-map", post(ai_scene_map_handler))
@@ -277,18 +286,41 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(text) = msg {
-            if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                let response = handle_command(ws_msg, &state).await;
-                if let Some(resp_msg) = response {
-                    if socket.send(Message::Text(resp_msg)).await.is_err() {
-                        println!("Failed to send response message");
+    let mut mcp_rx = state.mcp_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            val = socket.recv() => {
+                match val {
+                    Some(Ok(msg)) => {
+                        if let Message::Text(text) = msg {
+                            if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                                if ws_msg.msg_type == "UPDATE_TIMELINE_SNAPSHOT" {
+                                    if let Some(snapshot) = ws_msg.payload.get("snapshot").and_then(|s| s.as_str()) {
+                                        if let Ok(mut cache) = state.timeline_cache.write() {
+                                            *cache = snapshot.to_string();
+                                        }
+                                    }
+                                } else {
+                                    let response = handle_command(ws_msg, &state).await;
+                                    if let Some(resp_msg) = response {
+                                        if socket.send(Message::Text(resp_msg)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            mcp_msg = mcp_rx.recv() => {
+                if let Ok(msg_text) = mcp_msg {
+                    if socket.send(Message::Text(msg_text)).await.is_err() {
                         break;
                     }
                 }
-            } else {
-                println!("Received invalid JSON: {}", text);
             }
         }
     }
@@ -2367,6 +2399,42 @@ async fn synthesize_sources_handler(
         }
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct McpExecuteRequest {
+    operations: serde_json::Value,
+}
+
+async fn mcp_timeline_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cache = state.timeline_cache.read().unwrap();
+    (
+        axum::http::StatusCode::OK,
+        cache.clone()
+    )
+        .into_response()
+}
+
+async fn mcp_execute_handler(
+    State(state): State<AppState>,
+    Json(params): Json<McpExecuteRequest>,
+) -> impl IntoResponse {
+    let ws_payload = serde_json::json!({
+        "type": "MCP_EXECUTE",
+        "payload": {
+            "operations": params.operations
+        }
+    });
+    
+    let _ = state.mcp_tx.send(ws_payload.to_string());
+    
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "status": "success", "message": "operations broadcasted to editor" }))
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]

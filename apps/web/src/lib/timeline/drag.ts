@@ -31,6 +31,7 @@ export interface GraphicDragData extends BaseDragData {
 export interface EffectDragData extends BaseDragData {
 	type: "effect";
 	effectType: string;
+	params?: any;
 	targetElementTypes: VisualElement["type"][];
 }
 

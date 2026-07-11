@@ -1,4 +1,6 @@
 import type { EditorCore } from "@/core";
+import { useEditorStore } from "@/stores/editor-store";
+import { toast } from "sonner";
 
 export type ConnectionStatus = "connected" | "disconnected" | "connecting";
 
@@ -208,6 +210,106 @@ export class WebSocketManager {
 			case "CONNECTION_STATUS":
 				console.log(`Server status: ${message.payload.message}`);
 				break;
+			case "MCP_EXECUTE": {
+				const ops = message.payload.operations || [];
+				if (ops.length === 0) break;
+
+				const tracks = this.editor.timeline.getTracks();
+				const videoTrack = tracks.find((t) => t.type === "video");
+				const trackId = videoTrack?.id || "video_track";
+				const clips = videoTrack?.elements || [];
+				const proposedGhostClips: any[] = [];
+
+				ops.forEach((op: any, index: number) => {
+					const uuid = `proposed_mcp_${Date.now()}_${index}`;
+					if (op.action === "split") {
+						proposedGhostClips.push({
+							id: uuid,
+							trackId: op.track_id || trackId,
+							start: op.time,
+							end: op.time,
+							type: "split",
+							label: `Proposed Cut (${op.time.toFixed(1)}s)`,
+							operationId: "split",
+							isPendingSplit: true,
+							isInvalid: false,
+							operationData: op,
+						});
+					} else if (op.action === "delete") {
+						const targetClip = clips.find((c) => c.id === op.clip_id);
+						if (targetClip) {
+							proposedGhostClips.push({
+								id: uuid,
+								trackId: trackId,
+								start: targetClip.startTime,
+								end: targetClip.startTime + targetClip.duration,
+								type: "delete",
+								label: `Remove Clip "${targetClip.name}"`,
+								operationId: "delete",
+								isPendingDelete: true,
+								isInvalid: false,
+								originalClipId: targetClip.id,
+								operationData: op,
+							});
+						}
+					} else if (op.action === "trim") {
+						const targetClip = clips.find((c) => c.id === op.clip_id);
+						if (targetClip) {
+							const clipStart = targetClip.startTime;
+							const clipEnd = clipStart + targetClip.duration;
+							
+							if (op.start > 0) {
+								proposedGhostClips.push({
+									id: `${uuid}_trim_l`,
+									trackId: trackId,
+									start: clipStart,
+									end: clipStart + op.start,
+									type: "trim_left",
+									label: "Trim Out Left",
+									operationId: "delete",
+									isPendingDelete: true,
+									isInvalid: false,
+									operationData: { action: "trim_cut", clip_id: op.clip_id, start: 0, end: op.start },
+								});
+							}
+							
+							if (op.end < targetClip.duration) {
+								proposedGhostClips.push({
+									id: `${uuid}_trim_r`,
+									trackId: trackId,
+									start: clipStart + op.end,
+									end: clipEnd,
+									type: "trim_right",
+									label: "Trim Out Right",
+									operationId: "delete",
+									isPendingDelete: true,
+									isInvalid: false,
+									operationData: { action: "trim_cut", clip_id: op.clip_id, start: op.end, end: targetClip.duration },
+								});
+							}
+						}
+					} else {
+						const targetClip = clips.find((c) => c.id === op.clip_id);
+						proposedGhostClips.push({
+							id: uuid,
+							trackId: trackId,
+							start: targetClip?.startTime ?? 0,
+							end: targetClip ? targetClip.startTime + targetClip.duration : 5,
+							type: op.action,
+							label: `Change: ${op.action}`,
+							operationId: op.action,
+							isPendingDelete: false,
+							isPendingSplit: false,
+							isInvalid: false,
+							operationData: op,
+						});
+					}
+				});
+
+				useEditorStore.getState().setGhostClips(proposedGhostClips);
+				toast.success(`Received ${ops.length} proposed edits from AI MCP Server. Confirm on the right sidebar.`);
+				break;
+			}
 			default:
 				break;
 		}

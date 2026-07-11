@@ -1,0 +1,21 @@
+{
+  "name": "@chronox/mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol Server for ChronoX NLE Editor integration",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "chronox-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --target=node --outfile=dist/index.js --external @modelcontextprotocol/sdk",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
