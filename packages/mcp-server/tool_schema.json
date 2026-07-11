@@ -1,0 +1,506 @@
+{
+  "$schema": "editing-tools-schema/v1",
+  "description": "Tool schema cho agent/MCP điều khiển phần mềm dựng video. Mỗi tool là một thao tác nguyên tử. Trường 'technique_ids' trỏ ngược về knowledge_base_editing.md để LLM biết tool này phục vụ kỹ thuật nào. Trường 'path' ghi đường thao tác tay tương ứng (để hướng dẫn người, hoặc để agent GUI-automation biết bấm đâu).",
+  "conventions": {
+    "timecode": "định dạng HH:MM:SS:FF",
+    "audio_level_unit": "dB",
+    "destructive_ops_require_confirm": ["ripple_delete", "remove_silence"],
+    "observe_before_act": "Luôn gọi get_timeline_info trước mọi thao tác chỉnh sửa. Với quyết định màu, gọi get_waveform/get_vectorscope để kiểm."
+  },
+
+  "observation_tools": [
+    {
+      "name": "get_timeline_info",
+      "description": "Đọc trạng thái timeline hiện tại: số track, danh sách clip, độ dài, vị trí playhead. Gọi TRƯỚC mọi thao tác chỉnh sửa.",
+      "parameters": {},
+      "returns": "object: { tracks, clips[], duration, playhead }"
+    },
+    {
+      "name": "export_frame",
+      "description": "Xuất một frame tại timecode thành ảnh để vision model 'xem' và đánh giá màu/bố cục. Đây là 'đôi mắt' của agent.",
+      "parameters": {
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true }
+      },
+      "returns": "image"
+    },
+    {
+      "name": "get_waveform",
+      "description": "Trả về waveform (luminance scope) tại playhead để kiểm exposure/contrast. Nhìn scope thay vì tin màn hình.",
+      "parameters": { "timecode": { "type": "string", "pattern": "HH:MM:SS:FF" } },
+      "returns": "object: { luma_distribution, black_point_ire, white_point_ire }"
+    },
+    {
+      "name": "get_vectorscope",
+      "description": "Trả về vectorscope để kiểm skin tone nằm đúng skin-tone line và saturation.",
+      "parameters": { "timecode": { "type": "string", "pattern": "HH:MM:SS:FF" } },
+      "returns": "object: { skin_tone_alignment, saturation_spread }"
+    },
+    {
+      "name": "get_audio_levels",
+      "description": "Đo mức audio (peak dB, integrated LUFS) của một track hoặc cả timeline.",
+      "parameters": {
+        "track": { "type": "integer", "description": "để trống = cả timeline" }
+      },
+      "returns": "object: { peak_db, integrated_lufs, true_peak_dbtp }"
+    }
+  ],
+
+  "cut_tools": [
+    {
+      "name": "cut_at",
+      "description": "Cắt clip trên timeline tại timecode. Thao tác cơ bản cho hard cut, jump cut, beat match. KHÔNG dùng để xóa — dùng ripple_delete.",
+      "technique_ids": ["cut_hard", "cut_jump", "cut_beat", "cut_match"],
+      "path": { "resolve": "playhead → Ctrl/Cmd+B (Blade)", "premiere": "playhead → Ctrl/Cmd+K (Add Edit)" },
+      "parameters": {
+        "track": { "type": "integer", "minimum": 1, "required": true },
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true }
+      }
+    },
+    {
+      "name": "ripple_delete",
+      "description": "Xóa một đoạn và tự khép khoảng trống (timeline dồn lại). DESTRUCTIVE — xác nhận trước khi gọi.",
+      "technique_ids": ["cut_jump"],
+      "path": { "both": "chọn đoạn → Shift+Delete" },
+      "parameters": {
+        "track": { "type": "integer", "minimum": 1, "required": true },
+        "start": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true },
+        "end": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true }
+      },
+      "confirm_required": true
+    },
+    {
+      "name": "add_marker_at",
+      "description": "Đánh marker tại timecode. Dùng để đánh dấu beat nhạc trước khi cắt theo beat.",
+      "technique_ids": ["cut_beat"],
+      "path": { "both": "playhead → M" },
+      "parameters": { "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true } }
+    },
+    {
+      "name": "trim_audio_independent",
+      "description": "Trim mép audio của clip độc lập với video (lệch điểm cắt) để tạo J-cut/L-cut.",
+      "technique_ids": ["cut_jl"],
+      "path": { "resolve": "unlink Ctrl/Cmd+Alt+click → kéo mép audio", "premiere": "tắt Linked Selection → trim mép audio" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "audio_offset_frames": { "type": "integer", "description": "âm = audio vào trước hình (J-cut); dương = audio kéo dài (L-cut)", "required": true }
+      }
+    },
+    {
+      "name": "place_clip_on_track",
+      "description": "Đặt clip lên một track chỉ định (track ≥ 2 để làm B-roll overlay / mask transition / light leak).",
+      "technique_ids": ["cut_cutaway", "tr_mask", "tr_lightleak"],
+      "path": { "both": "kéo clip lên track V2+" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "track": { "type": "integer", "minimum": 2, "required": true },
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true },
+        "blend_mode": { "type": "string", "enum": ["normal", "screen", "add"], "default": "normal", "description": "screen/add cho light leak" }
+      }
+    },
+    {
+      "name": "mute_clip_audio",
+      "description": "Tắt audio của một clip (dùng khi chèn B-roll để không chồng tiếng).",
+      "technique_ids": ["cut_cutaway"],
+      "parameters": { "clip_id": { "type": "string", "required": true } }
+    }
+  ],
+
+  "transition_tools": [
+    {
+      "name": "set_retime_curve",
+      "description": "Thay đổi tốc độ phát của clip theo đường cong keyframe. Đây là cách tạo speed ramp.",
+      "technique_ids": ["tr_speedramp"],
+      "path": { "resolve": "chuột phải → Retime Controls (Ctrl/Cmd+R) → Retime Curve", "premiere": "Show Clip Keyframes → Time Remapping → Speed, tách đôi keyframe" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "keyframes": { "type": "array", "items": { "type": "array", "description": "[timecode, speed_percent]" }, "required": true }
+      },
+      "requires": "footage ≥60fps nếu speed < 50%"
+    },
+    {
+      "name": "enable_optical_flow",
+      "description": "Bật làm mượt frame nội suy cho retime chậm (tránh giật). Đi kèm set_retime_curve.",
+      "technique_ids": ["tr_speedramp"],
+      "path": { "resolve": "Project Settings → Optical Flow + Speed Warp", "premiere": "render với Optical Flow" },
+      "parameters": { "clip_id": { "type": "string", "required": true } }
+    },
+    {
+      "name": "add_transition",
+      "description": "Thêm transition dựng sẵn tại điểm cắt giữa hai clip.",
+      "technique_ids": ["tr_lumafade"],
+      "path": { "both": "kéo transition vào điểm cắt" },
+      "parameters": {
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true },
+        "type": { "type": "string", "enum": ["cross_dissolve", "luma_fade", "dip_to_black", "dip_to_white"], "required": true },
+        "duration_frames": { "type": "integer", "default": 15 }
+      }
+    },
+    {
+      "name": "add_directional_blur",
+      "description": "Thêm directional (motion) blur tăng/giảm dần để làm whip pan transition.",
+      "technique_ids": ["tr_whip"],
+      "path": { "resolve": "ResolveFX Directional Blur", "premiere": "Directional Blur, keyframe Blur Length" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "angle": { "type": "number", "description": "hướng blur, khớp hướng lia máy" },
+        "length_keyframes": { "type": "array", "items": { "type": "array", "description": "[timecode, blur_length]" } }
+      }
+    },
+    {
+      "name": "add_zoom_blur",
+      "description": "Thêm radial/zoom blur cho zoom transition.",
+      "technique_ids": ["tr_zoom"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "amount_keyframes": { "type": "array", "items": { "type": "array" } }
+      }
+    },
+    {
+      "name": "apply_power_window",
+      "description": "Vẽ mask (power window) trên clip theo hình vật thể — bước 1 của mask transition.",
+      "technique_ids": ["tr_mask"],
+      "path": { "resolve": "Color page → Power Window", "premiere": "Pen tool vẽ mask" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "shape": { "type": "string", "enum": ["polygon", "curve"], "default": "curve" },
+        "points": { "type": "array", "description": "toạ độ đỉnh mask ở frame khởi đầu" }
+      }
+    },
+    {
+      "name": "enable_mask_tracking",
+      "description": "Bật tracking để mask bám theo vật thể qua các frame — bước 2 của mask transition.",
+      "technique_ids": ["tr_mask"],
+      "path": { "resolve": "Tracker trong Color page", "premiere": "Mask → Track selected mask" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "direction": { "type": "string", "enum": ["forward", "backward", "both"], "default": "forward" }
+      },
+      "fallback": "nếu vật thể đi quá nhanh và tracking trượt → chuyển sang keyframe mask thủ công đoạn đó"
+    },
+    {
+      "name": "refine_mask_edges",
+      "description": "Làm mềm viền mask (feather) — bước cuối mask transition.",
+      "technique_ids": ["tr_mask"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "feather_px": { "type": "integer", "default": 30, "description": "20–40 cho viền mềm tự nhiên" }
+      }
+    },
+    {
+      "name": "add_sfx",
+      "description": "Thêm sound effect (whoosh/impact/riser) tại điểm chuyển/nhấn. QUAN TRỌNG đi kèm whip_pan và zoom transition.",
+      "technique_ids": ["au_sfx", "tr_whip", "tr_zoom"],
+      "parameters": {
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true },
+        "type": { "type": "string", "enum": ["whoosh", "impact", "boom", "riser"], "required": true },
+        "level_db": { "type": "number", "default": -12, "description": "-10 đến -15dB" }
+      }
+    }
+  ],
+
+  "motion_tools": [
+    {
+      "name": "set_transform_keyframes",
+      "description": "Animate scale/position/rotation của clip. Dùng cho punch-in, Ken Burns, text animation, match cut, camera shake.",
+      "technique_ids": ["mo_punchin", "mo_kenburns", "mo_text", "cut_match"],
+      "path": { "both": "Effect Controls / Inspector → keyframe Scale/Position/Rotation" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "scale_keyframes": { "type": "array", "items": { "type": "array", "description": "[timecode, scale_percent]" } },
+        "position_keyframes": { "type": "array", "items": { "type": "array", "description": "[timecode, [x,y]]" } },
+        "rotation_keyframes": { "type": "array", "items": { "type": "array" } }
+      },
+      "requires": "quay độ phân giải cao hơn timeline nếu punch-in >105% để không vỡ hình"
+    },
+    {
+      "name": "set_easing",
+      "description": "Đổi kiểu nội suy keyframe từ linear sang ease. PHÂN BIỆT animation amateur vs pro — áp cho MỌI keyframe chuyển động.",
+      "technique_ids": ["mo_easing", "mo_kenburns", "mo_text", "mo_punchin"],
+      "path": { "both": "chuột phải keyframe → Ease In/Out; tinh chỉnh trong Graph/Curve Editor" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "interpolation": { "type": "string", "enum": ["ease_in", "ease_out", "ease_in_out", "custom_curve"], "default": "ease_in_out" }
+      }
+    },
+    {
+      "name": "set_motion_blur",
+      "description": "Bật motion blur cho layer có animation (tránh giật khi chuyển động nhanh).",
+      "technique_ids": ["mo_motionblur", "mo_text"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "enable": { "type": "boolean", "default": true } }
+    },
+    {
+      "name": "add_camera_shake",
+      "description": "Thêm rung máy giả (dao động position ngẫu nhiên) cho đoạn năng lượng cao.",
+      "technique_ids": ["mo_shake"],
+      "path": { "aftereffects": "expression wiggle()", "both": "keyframe Position dao động nhỏ / plugin" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "intensity": { "type": "number", "description": "biên độ rung, giữ nhỏ" },
+        "frequency": { "type": "number" }
+      }
+    },
+    {
+      "name": "add_text_layer",
+      "description": "Tạo text/title/lower-third. Kết hợp set_transform_keyframes + set_motion_blur để làm animation.",
+      "technique_ids": ["mo_text"],
+      "path": { "resolve": "Fusion / Text+", "premiere": "Essential Graphics" },
+      "parameters": {
+        "content": { "type": "string", "required": true },
+        "track": { "type": "integer", "minimum": 2, "required": true },
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true },
+        "style": { "type": "string", "enum": ["title", "lower_third", "caption"] }
+      }
+    }
+  ],
+
+  "color_tools": [
+    {
+      "name": "apply_lut",
+      "description": "Áp LUT. type=conversion để convert Log (bước 1); type=creative để làm mood (bước 3, sau correction).",
+      "technique_ids": ["co_convert", "co_lutbase"],
+      "path": { "resolve": "Color Space Transform / LUT node", "premiere": "Lumetri → Basic → Input LUT / Creative → Look" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "lut_name": { "type": "string", "required": true },
+        "type": { "type": "string", "enum": ["conversion", "creative"], "required": true }
+      },
+      "note": "creative LUT áp lên footage CHƯA correction → kết quả bất định. Luôn correction trước."
+    },
+    {
+      "name": "set_lut_intensity",
+      "description": "Giảm cường độ creative LUT nếu quá gắt.",
+      "technique_ids": ["co_lutbase"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "intensity_percent": { "type": "number", "default": 100 } }
+    },
+    {
+      "name": "set_exposure",
+      "description": "Chỉnh phơi sáng. Đích: waveform gọn 0–100 IRE, skin tone 55–70 IRE.",
+      "technique_ids": ["co_correction"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "value": { "type": "number", "required": true } }
+    },
+    {
+      "name": "set_white_balance",
+      "description": "Cân bằng trắng qua Temp/Tint hoặc eyedropper vùng trắng trung tính.",
+      "technique_ids": ["co_correction"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "temperature": { "type": "number" },
+        "tint": { "type": "number" },
+        "eyedropper_point": { "type": "array", "description": "[x,y] vùng trắng nếu dùng pick" }
+      }
+    },
+    {
+      "name": "set_contrast",
+      "description": "Chỉnh contrast: kéo highlight xuống -20 đến -40 cứu trời cháy, nâng shadow +5 đến +15 nếu bết.",
+      "technique_ids": ["co_correction"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "highlights": { "type": "number" },
+        "shadows": { "type": "number" },
+        "contrast": { "type": "number" }
+      }
+    },
+    {
+      "name": "set_color_wheels",
+      "description": "Chỉnh Lift/Gamma/Gain (shadows/mids/highlights). Dùng cho teal-orange: shadows→teal, highlights→orange.",
+      "technique_ids": ["co_tealorange", "co_correction"],
+      "path": { "resolve": "Color Wheels (Primaries)", "premiere": "Lumetri → Color Wheels" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "lift": { "type": "array", "description": "[r,g,b] shadows — đẩy về teal 3–8 điểm nhẹ" },
+        "gamma": { "type": "array", "description": "[r,g,b] mids" },
+        "gain": { "type": "array", "description": "[r,g,b] highlights — đẩy về orange nhẹ" }
+      }
+    },
+    {
+      "name": "set_curves",
+      "description": "Chỉnh curves. Kéo điểm đen master curve lên ~5–10% = film fade look (lifted blacks).",
+      "technique_ids": ["co_curvesfade"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "channel": { "type": "string", "enum": ["master", "red", "green", "blue"], "default": "master" },
+        "points": { "type": "array", "description": "danh sách [input, output] điểm curve" }
+      }
+    },
+    {
+      "name": "set_saturation",
+      "description": "Chỉnh saturation tổng. Cinematic: giảm còn 85–95 rồi tăng chọn lọc bằng set_hue_vs_sat.",
+      "technique_ids": ["co_saturation"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "value": { "type": "number", "default": 100 } }
+    },
+    {
+      "name": "set_hue_vs_sat",
+      "description": "Tăng/giảm saturation riêng từng dải màu (tăng chọn lọc màu chủ đạo).",
+      "technique_ids": ["co_saturation"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "adjustments": { "type": "array", "items": { "type": "array", "description": "[hue_range, sat_delta]" } }
+      }
+    },
+    {
+      "name": "set_hsl_secondary",
+      "description": "Chọn một vùng màu (qualifier) để chỉnh riêng. Dùng bảo vệ skin tone: chọn da, kéo về skin-tone line.",
+      "technique_ids": ["co_skintone"],
+      "path": { "resolve": "Qualifier + Power Window", "premiere": "Lumetri → HSL Secondary" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "target": { "type": "string", "enum": ["skin", "sky", "foliage", "custom"], "required": true },
+        "hue_shift": { "type": "number" },
+        "sat_shift": { "type": "number" }
+      },
+      "verify_with": "get_vectorscope — da phải nằm dọc skin-tone line (~11 giờ)"
+    },
+    {
+      "name": "shot_match",
+      "description": "Khớp màu nhiều shot quay điều kiện ánh sáng khác nhau về một reference cho liền mạch.",
+      "technique_ids": ["co_shotmatch"],
+      "path": { "resolve": "Shot Match / Gallery still", "premiere": "Lumetri → Color Match, Comparison View" },
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "reference_clip_id": { "type": "string", "required": true }
+      },
+      "note": "auto match cần tinh chỉnh tay sau; kiểm da người bằng get_vectorscope"
+    },
+    {
+      "name": "add_vignette",
+      "description": "Tối bốn góc hút mắt vào chủ thể (finishing).",
+      "technique_ids": ["co_finishing"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "amount": { "type": "number", "default": -1, "description": "-0.5 đến -1.5" },
+        "feather": { "type": "number", "default": 50 }
+      }
+    },
+    {
+      "name": "add_grain",
+      "description": "Thêm film grain tăng chất film (finishing). Giữ 10–20% opacity.",
+      "technique_ids": ["co_finishing"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "opacity_percent": { "type": "number", "default": 15 } }
+    },
+    {
+      "name": "add_sharpen",
+      "description": "Sharpen nhẹ cho nét (finishing). 10–25.",
+      "technique_ids": ["co_finishing"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "amount": { "type": "number", "default": 15 } }
+    },
+    {
+      "name": "add_letterbox",
+      "description": "Thêm viền đen trên/dưới tỉ lệ điện ảnh. KHÔNG dùng cho talkshow (cắt mặt người).",
+      "technique_ids": ["co_finishing"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "aspect_ratio": { "type": "string", "default": "2.35:1" } }
+    }
+  ],
+
+  "audio_tools": [
+    {
+      "name": "set_audio_level",
+      "description": "Đặt mức âm lượng một track/clip. Nhạc khi có thoại -18 đến -25dB; montage -6 đến -3dB; ambient -20 đến -30dB.",
+      "technique_ids": ["au_music", "au_ambient"],
+      "parameters": {
+        "target_id": { "type": "string", "required": true, "description": "track hoặc clip id" },
+        "level_db": { "type": "number", "required": true }
+      }
+    },
+    {
+      "name": "set_volume_keyframes",
+      "description": "Keyframe âm lượng theo thời gian (hạ nhạc thủ công ở đoạn thoại nếu không auto-duck).",
+      "technique_ids": ["au_music", "au_ducking"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "keyframes": { "type": "array", "items": { "type": "array", "description": "[timecode, level_db]" } }
+      }
+    },
+    {
+      "name": "place_audio_clip",
+      "description": "Đặt clip audio (nhạc/ambient/foley/sfx) lên track chỉ định.",
+      "technique_ids": ["au_ambient", "au_foley", "au_music"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "track": { "type": "string", "required": true, "description": "music/ambient/sfx/dialogue" },
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true }
+      }
+    },
+    {
+      "name": "add_audio_fade",
+      "description": "Crossfade tại điểm cắt audio (bắt buộc mọi điểm cắt tiếng để tránh click).",
+      "technique_ids": ["au_crossfade"],
+      "parameters": {
+        "timecode": { "type": "string", "pattern": "HH:MM:SS:FF", "required": true },
+        "type": { "type": "string", "enum": ["constant_power", "constant_gain", "exponential"], "default": "constant_power" },
+        "length_frames": { "type": "integer", "default": 3, "description": "2–5 frame" }
+      }
+    },
+    {
+      "name": "apply_ducking",
+      "description": "Tự động hạ nhạc khi có thoại rồi nâng lại. Bắt buộc khi có cả nhạc + lời.",
+      "technique_ids": ["au_ducking"],
+      "path": { "premiere": "Essential Sound → auto-ducking", "resolve": "Fairlight sidechain compressor" },
+      "parameters": {
+        "music_track": { "type": "string", "required": true },
+        "dialogue_track": { "type": "string", "required": true },
+        "reduction_db": { "type": "number", "default": 12, "description": "10–15dB" },
+        "fade_ms": { "type": "number", "default": 300, "description": "200–500ms" }
+      }
+    },
+    {
+      "name": "apply_highpass",
+      "description": "High-pass filter cắt tần thấp (bỏ ù trầm giọng). Bước 1 chuỗi voiceover.",
+      "technique_ids": ["au_voiceover"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "cutoff_hz": { "type": "number", "default": 90, "description": "80–100Hz" } }
+    },
+    {
+      "name": "set_eq",
+      "description": "EQ giọng: giảm 200–300Hz nếu đục, nâng 3–5kHz cho rõ. Bước 2 chuỗi voiceover.",
+      "technique_ids": ["au_voiceover"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "bands": { "type": "array", "items": { "type": "array", "description": "[freq_hz, gain_db, q]" } }
+      }
+    },
+    {
+      "name": "apply_compressor",
+      "description": "Compressor đều âm lượng giọng. Bước 3 chuỗi voiceover.",
+      "technique_ids": ["au_voiceover"],
+      "parameters": {
+        "clip_id": { "type": "string", "required": true },
+        "ratio": { "type": "number", "default": 3, "description": "2:1–4:1" },
+        "threshold_db": { "type": "number", "description": "sao cho giảm 3–6dB ở câu to" }
+      }
+    },
+    {
+      "name": "apply_denoise",
+      "description": "Khử ồn nền / vọng phòng. Bước 4 chuỗi voiceover. Giữ 20–40% (quá tay → robot).",
+      "technique_ids": ["au_voiceover"],
+      "parameters": { "clip_id": { "type": "string", "required": true }, "amount_percent": { "type": "number", "default": 30 } }
+    },
+    {
+      "name": "enhance_speech",
+      "description": "AI enhance giọng thu mic yếu thành như studio; tách giọng khỏi ồn. Giữ 60–80%.",
+      "technique_ids": ["au_enhance"],
+      "path": { "premiere": "Enhance Speech", "resolve": "Voice Isolation (Fairlight)", "external": "Adobe Podcast Enhance" },
+      "parameters": { "clip_id": { "type": "string", "required": true }, "amount_percent": { "type": "number", "default": 70 } }
+    },
+    {
+      "name": "normalize_loudness",
+      "description": "Chuẩn hóa loudness cả video về đích. YouTube: -14 LUFS integrated, true peak ≤ -1dBTP.",
+      "technique_ids": ["au_loudness"],
+      "parameters": {
+        "target_lufs": { "type": "number", "default": -14 },
+        "true_peak_dbtp": { "type": "number", "default": -1 }
+      },
+      "verify_with": "get_audio_levels — peak KHÔNG được chạm/vượt 0dB (clip)"
+    },
+    {
+      "name": "remove_silence",
+      "description": "Cắt khoảng lặng chết. DESTRUCTIVE — xác nhận trước. Với podcast/interview đặt preserve_thinking_pauses=true.",
+      "technique_ids": ["au_silence"],
+      "parameters": {
+        "track": { "type": "string", "required": true },
+        "min_gap_seconds": { "type": "number", "default": 2 },
+        "preserve_thinking_pauses": { "type": "boolean", "default": false, "description": "true cho podcast — GIỮ quãng ngập ngừng trước câu trả lời có suy nghĩ" }
+      },
+      "confirm_required": true,
+      "judgment_note": "Giữ hay cắt filler phụ thuộc THỂ LOẠI + Ý ĐỒ, không phải rule cứng. Detection ≠ judgment — ca mập mờ đẩy lên người quyết."
+    }
+  ]
+}

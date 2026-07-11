@@ -159,6 +159,32 @@ async fn main() {
         (),
     ).expect("Failed to create scene_vectors table");
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS episodic_memory (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            situation TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL
+        )",
+        (),
+    ).expect("Failed to create episodic_memory table");
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS knowledge_gap_queue (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            frequency INTEGER NOT NULL,
+            status TEXT NOT NULL
+        )",
+        (),
+    ).expect("Failed to create knowledge_gap_queue table");
+
     // 3. Setup single-threaded MPSC SQLite actor loop
     let (db_tx, mut db_rx) = tokio::sync::mpsc::channel::<DbCommand>(200);
     let mut bg_conn = Connection::open("chronox.db").expect("Failed to open background database");
@@ -237,6 +263,8 @@ async fn main() {
         .route("/api/ai/transcribe", post(ai_transcribe_handler))
         .route("/api/ai/detect-beats", post(ai_detect_beats_handler))
         .route("/api/vision-tag", post(vision_tag_handler))
+        .route("/api/ai/write-back", post(ai_write_back_handler))
+        .route("/api/ai/query-episodic", post(ai_query_episodic_handler))
         .nest_service("/static", tower_http::services::ServeDir::new("./shared_storage"))
         // Media uploads can be hundreds of MB; lift axum's 2MB default cap.
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
@@ -1446,6 +1474,159 @@ fn resolve_static_path_to_abs(path: &str) -> String {
     }
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+struct WriteBackRequest {
+    searchable: String,
+    situation: serde_json::Value,
+    decision: String,
+    reason: String,
+    confidence: Option<f64>,
+    source: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct QueryEpisodicRequest {
+    the_loai: Option<String>,
+    loai_quyet_dinh: Option<String>,
+    query_text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct EpisodicMemoryRecord {
+    id: String,
+    timestamp: String,
+    searchable: String,
+    situation: serde_json::Value,
+    decision: String,
+    reason: String,
+    confidence: f64,
+    source: String,
+    status: String,
+}
+
+fn jaccard_similarity(s1: &str, s2: &str) -> f64 {
+    let w1: std::collections::HashSet<&str> = s1.split_whitespace()
+        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let w2: std::collections::HashSet<&str> = s2.split_whitespace()
+        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if w1.is_empty() && w2.is_empty() {
+        return 1.0;
+    }
+    let intersection = w1.intersection(&w2).count() as f64;
+    let union = w1.union(&w2).count() as f64;
+    intersection / union
+}
+
+async fn ai_write_back_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<WriteBackRequest>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let now = secs.to_string();
+    let situation_str = serde_json::to_string(&payload.situation).unwrap_or_default();
+    
+    let db = state.db.lock().unwrap();
+    let res = db.execute(
+        "INSERT INTO episodic_memory (id, timestamp, searchable, situation, decision, reason, confidence, source, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            id,
+            now,
+            payload.searchable,
+            situation_str,
+            payload.decision,
+            payload.reason,
+            payload.confidence.unwrap_or(1.0),
+            payload.source.unwrap_or_else(|| "user_edit".to_string()),
+            payload.status.unwrap_or_else(|| "active".to_string()),
+        ],
+    );
+
+    match res {
+        Ok(_) => (axum::http::StatusCode::OK, Json(serde_json::json!({ "status": "success", "id": id }))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save episodic memory: {}", e)).into_response(),
+    }
+}
+
+async fn ai_query_episodic_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<QueryEpisodicRequest>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    let mut stmt = match db.prepare("SELECT id, timestamp, searchable, situation, decision, reason, confidence, source, status FROM episodic_memory") {
+        Ok(s) => s,
+        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to prepare query: {}", e)).into_response(),
+    };
+
+    let records_iter = match stmt.query_map((), |row| {
+        let sit_str: String = row.get(3)?;
+        let sit_val: serde_json::Value = serde_json::from_str(&sit_str).unwrap_or(serde_json::Value::Null);
+        Ok(EpisodicMemoryRecord {
+            id: row.get(0)?,
+            timestamp: row.get(1)?,
+            searchable: row.get(2)?,
+            situation: sit_val,
+            decision: row.get(4)?,
+            reason: row.get(5)?,
+            confidence: row.get(6)?,
+            source: row.get(7)?,
+            status: row.get(8)?,
+        })
+    }) {
+        Ok(iter) => iter,
+        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to execute query: {}", e)).into_response(),
+    };
+
+    let mut matched_records = Vec::new();
+    for r in records_iter {
+        if let Ok(rec) = r {
+            // Apply pre-filter: the_loai and loai_quyet_dinh if specified
+            if let Some(ref filter_loai) = payload.the_loai {
+                if let Some(t) = rec.situation.get("the_loai").and_then(|x| x.as_str()) {
+                    if t != filter_loai {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            if let Some(ref filter_qd) = payload.loai_quyet_dinh {
+                if let Some(qd) = rec.situation.get("loai_quyet_dinh").and_then(|x| x.as_str()) {
+                    if qd != filter_qd {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            // Calculate Jaccard score
+            let score = jaccard_similarity(&payload.query_text, &rec.searchable);
+            matched_records.push((rec, score));
+        }
+    }
+
+    // Sort descending by Jaccard similarity score
+    matched_records.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Limit to top 5
+    let result: Vec<EpisodicMemoryRecord> = matched_records.into_iter()
+        .take(5)
+        .map(|(rec, _)| rec)
+        .collect();
+
+    Json(result).into_response()
+}
+
 async fn ai_mimic_flow_handler(
     State(_state): State<AppState>,
     Json(payload): Json<MimicFlowRequest>,
@@ -2500,7 +2681,7 @@ struct ApplyRecipeResponse {
 }
 
 async fn apply_recipe_handler(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(params): Json<ApplyRecipeRequest>,
 ) -> impl IntoResponse {
     let tools = params.tools.clone().unwrap_or_else(|| serde_json::json!([]));
@@ -2510,19 +2691,77 @@ async fn apply_recipe_handler(
         "Target the entire timeline (or prioritize the active/first video tracks/clips).".to_string()
     };
 
+    // Query episodic memory matching the recipe context (Jaccard similarity search on recipe text)
+    let episodic_context = {
+        let mut episodic_records = Vec::new();
+        {
+            let db = state.db.lock().unwrap();
+            let stmt_res = db.prepare("SELECT id, timestamp, searchable, situation, decision, reason, confidence, source, status FROM episodic_memory WHERE status = 'active'");
+            if let Ok(mut stmt) = stmt_res {
+                let records_iter = stmt.query_map((), |row| {
+                    let sit_str: String = row.get(3)?;
+                    let sit_val: serde_json::Value = serde_json::from_str(&sit_str).unwrap_or(serde_json::Value::Null);
+                    Ok(EpisodicMemoryRecord {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        searchable: row.get(2)?,
+                        situation: sit_val,
+                        decision: row.get(4)?,
+                        reason: row.get(5)?,
+                        confidence: row.get(6)?,
+                        source: row.get(7)?,
+                        status: row.get(8)?,
+                    })
+                });
+                if let Ok(iter) = records_iter {
+                    for r in iter {
+                        if let Ok(rec) = r {
+                            episodic_records.push(rec);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut matches = Vec::new();
+        for rec in episodic_records {
+            let score = jaccard_similarity(&params.recipe, &rec.searchable);
+            if score > 0.05 {
+                matches.push((rec.searchable, rec.situation, rec.decision, rec.reason, score));
+            }
+        }
+        matches.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let mut ctx = String::new();
+        for (i, (searchable, situation, decision, reason, _)) in matches.into_iter().take(4).enumerate() {
+            let genre = situation.get("the_loai").and_then(|x| x.as_str()).unwrap_or("general");
+            ctx.push_str(&format!(
+                "- Memory {} (Genre: {}): Context: \"{}\" -> User Decision: {}, Reason: \"{}\"\n",
+                i + 1, genre, searchable, decision, reason
+            ));
+        }
+        if ctx.is_empty() {
+            "No relevant episodic memories of past user edit corrections found.".to_string()
+        } else {
+            ctx
+        }
+    };
+
     let user_content = format!(
         "=== TIMELINE STATE ===\n{}\n=== END TIMELINE STATE ===\n\n\
 === STYLE PRESET RECIPE ===\n{}\n=== END STYLE PRESET RECIPE ===\n\n\
+=== EPISODIC MEMORIES (PAST USER CORRECTIONS) ===\n{}\n=== END EPISODIC MEMORIES ===\n\n\
 {}\n\n\
 Read the style preset recipe and translate its instructions (color grading, pacing/cuts, transitions, effects/transforms) into concrete editor operations on the targeted clip(s)/timeline. \
 Output the JSON block containing the operations: {{\"operations\": [...]}}. Only use valid actions from the schema.",
         params.timeline_state,
         params.recipe,
+        episodic_context,
         target_msg
     );
 
     let mut system_prompt = SYSTEM_PROMPT.to_string();
-    system_prompt.push_str("\n\n=== SPECIAL INSTRUCTION ===\nTranslate the provided Markdown Style Recipe into a sequence of editing operations. Keep the explanation very brief. Output the JSON block containing the operations.");
+    system_prompt.push_str("\n\n=== SPECIAL INSTRUCTION ===\nTranslate the provided Markdown Style Recipe into a sequence of editing operations. Keep the explanation very brief. Output the JSON block containing the operations. If any instruction is not present in your knowledge base (docs/knowledge_base_editing.md), output 'unknown_technique: [name]'.");
 
     let provider = params
         .provider

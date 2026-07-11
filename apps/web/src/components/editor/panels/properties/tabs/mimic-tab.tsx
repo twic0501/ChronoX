@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useEditor } from "@/hooks/use-editor";
 import { useMimicStore } from "@/stores/mimic-store";
 import { Button } from "@/components/ui/button";
@@ -64,6 +64,7 @@ export function MimicTab() {
 	const [cardCustomRanges, setCardCustomRanges] = useState<Record<string, { start: string; end: string }>>({});
 	const [applyingCardId, setApplyingCardId] = useState<string | null>(null);
 	const [searchQuery, setSearchQuery] = useState("");
+	const lastProposedOpsRef = useRef<any[]>([]);
 
 	// Load saved presets on mount
 	useEffect(() => {
@@ -268,6 +269,7 @@ export function MimicTab() {
 
 			const data = await res.json();
 			const ops = data.operations || [];
+			lastProposedOpsRef.current = ops;
 			if (ops.length === 0) {
 				toast.dismiss("apply-recipe");
 				toast.info("No timeline changes generated.");
@@ -376,6 +378,33 @@ export function MimicTab() {
 		}
 	};
 
+	const saveEpisodicDecision = async (op: any, decision: "KEEP" | "REJECT", reason: string) => {
+		try {
+			const searchable = `${op.action} operation on clip ${op.clip_id || "timeline"}${op.time ? ` at ${op.time.toFixed(1)}s` : ""}`;
+			const situation = {
+				the_loai: "general",
+				loai_quyet_dinh: op.action === "delete" || op.action === "split" ? "cut_hay_giữ" : "apply_effect",
+			};
+
+			const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+			await fetch(`${API_URL}/api/ai/write-back`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					searchable,
+					situation,
+					decision,
+					reason,
+					confidence: 1.0,
+					source: "user_timeline_feedback",
+					status: "active",
+				}),
+			});
+		} catch (e) {
+			console.error("Failed to write back episodic memory:", e);
+		}
+	};
+
 	const handleConfirmProposedEdits = async () => {
 		const remainingOps = ghostClips
 			.map((c) => c.operationData)
@@ -386,6 +415,20 @@ export function MimicTab() {
 			useEditorStore.getState().clearGhostClips();
 			return;
 		}
+
+		// Write-back: Compare proposed vs remaining
+		lastProposedOpsRef.current.forEach((op) => {
+			const isKept = remainingOps.some((rem) => 
+				rem.action === op.action && 
+				rem.clip_id === op.clip_id && 
+				(rem.time === op.time || rem.start === op.start)
+			);
+			if (isKept) {
+				saveEpisodicDecision(op, "KEEP", "User confirmed proposed timeline edit");
+			} else {
+				saveEpisodicDecision(op, "REJECT", "User discarded proposed timeline edit");
+			}
+		});
 
 		try {
 			const { BatchCommand } = await import("@/lib/commands/batch-command");
@@ -418,6 +461,9 @@ export function MimicTab() {
 	};
 
 	const handleRejectProposedEdits = () => {
+		lastProposedOpsRef.current.forEach((op) => {
+			saveEpisodicDecision(op, "REJECT", "User rejected all proposed edits");
+		});
 		useEditorStore.getState().clearGhostClips();
 		toast.info("Proposed edits discarded.");
 	};
