@@ -1,6 +1,6 @@
 # 🎬 ChronoX AI Editor
 
-**ChronoX** is a professional-grade, AI-powered non-linear editing (NLE) ecosystem. It bridges the gap between high-end professional post-production workflows and intuitive natural language automation. Powered by a **multi-provider vision AI system** (Gemini · OpenAI · Anthropic · Grok, or local Ollama), ChronoX understands cinematic editing theory (such as J-cuts, match cuts, B-roll selection, and music beat sync) and compiles conversational prompts directly into precise timeline actions — and, crucially, it **looks at your actual footage** frame-by-frame instead of guessing from metadata.
+**ChronoX** is a professional-grade, AI-powered non-linear editing (NLE) ecosystem. It bridges the gap between high-end professional post-production workflows and intuitive natural language automation. Powered by a **cloud multi-provider vision AI system** (Gemini · OpenAI · Anthropic · Grok), ChronoX understands cinematic editing theory (such as J-cuts, match cuts, B-roll selection, and music beat sync) and compiles conversational prompts directly into precise timeline actions — and, crucially, it **looks at your actual footage** frame-by-frame instead of guessing from metadata.
 
 ---
 
@@ -35,7 +35,7 @@ The AI grades and curates from the **real pixels** of each scene, not from coars
 - **Vision scene curation** (`curate_scenes_vision` → `/api/ai/curate-scenes`): an editor model keeps the strong shots and cuts blurry / over-exposed / empty / duplicate ones, then ripple-closes the gaps.
 - **Vision recipe extraction** (`/api/ai/extract-recipe`): turns a reference video into modular **Style Cards** (color · transitions · pacing · effects) grounded in what the model actually sees (log look, film grain, letterbox, hard cuts…).
 - **Vision + RAG match-up** (`/api/ai/apply-recipe`): drag a Style Card onto a clip — the model sees the target frame, retrieves the relevant editor **skill recipe** (RAG-grounded) and emits the exact operations (e.g. `upsert_keyframe` zoom/bounce, color wheels) tuned to that footage, blended with SurfSense episodic memory.
-- All vision endpoints are **provider-agnostic** (Gemini `inline_data` · OpenAI `image_url` · Anthropic `image source`).
+- All vision endpoints are **provider-agnostic** (Gemini `inline_data` · OpenAI `image_url` · Anthropic `image source`) and **cloud-only** — no local model weights required.
 
 ### 6. 🎞️ WYSIWYG Export
 Export renders the **exact preview scene graph** frame-by-frame (color grades, per-clip effects, transforms, keyframe animations, adjustment layers and transitions) and honours the fine-tune options (resolution · fps · format · quality · audio). A server-side FFmpeg exporter is kept as a fast fallback.
@@ -50,18 +50,14 @@ ChronoX employs a high-performance, hybrid decentralized architecture:
 graph TD
     A[Next.js 16 WebGL Frontend] <-->|WebSockets & JSON APIs| B[Rust Axum Core Backend]
     B <-->|SQLite Delta Sync| C[SQLite Database]
-    B <-->|FastAPI RPC| D[Python AI Inference Worker]
-    D -->|Local Inference| E[ONNX Runtime / PyTorch Suite]
+    B <-->|Vision/Chat APIs| E[Cloud AI Providers: Gemini · OpenAI · Anthropic · Grok]
+    B <-->|FFmpeg / OpenCV RPC| D[Python Media Worker]
 ```
 
 - **Frontend**: Next.js 16+, TypeScript, and TailwindCSS. Built with a custom WebGL rendering pipeline that supports real-time video playback, color grading wheels, and complex vector masking overlays.
 - **Core Backend**: Built with Rust (Axum, Tokio). Manages real-time collaborative state, WebSocket client connections, and writes project timeline deltas directly to a local SQLite database (`chronox.db`).
-- **AI Worker**: Built in Python with FastAPI. Orchestrates a suite of local models running on CPU/GPU via ONNX Runtime:
-  - **faster-whisper (distil-large-v3)**: High-speed speech-to-text.
-  - **pyannote-v3**: Voice Activity Detection (VAD) and speaker diarization.
-  - **YOLOv12-seg & OSNet**: Multi-target object segmentation and re-identification tracking.
-  - **SigLIP2**: Semantic visual search for B-roll matching and frame analysis.
-  - **Ollama**: Local Qwen/Llama models acting as the timeline compiler.
+- **AI Intelligence**: **Cloud, multi-provider** (Gemini · OpenAI · Anthropic · Grok). All reasoning, vision grading/curation, recipe extraction and match-up run through hosted APIs — **no local LLM or model weights required**. Keys are supplied in-app or via `.env` fallback.
+- **Media Worker**: A lightweight Python/FastAPI service for CPU media utilities only — **FFmpeg** frame/scene sampling and **OpenCV / PySceneDetect** shot detection that feed real frames to the vision models. Optional and stateless; it holds no model weights.
 
 ---
 
@@ -73,30 +69,27 @@ Follow these steps to set up ChronoX on your local machine:
 Ensure you have the following installed:
 - **Rust (Cargo)** (v1.75+)
 - **Node.js / Bun** (v1.0+)
-- **Python** (v3.10+) with `venv` or `conda`
+- **Python** (v3.10+) — for the optional media worker
 - **FFmpeg** (installed on system path)
-- **Ollama** (for local agent intelligence)
+- An **API key** for at least one cloud provider (Gemini · OpenAI · Anthropic · Grok)
 
-### 2. Download Model Weights
-Initialize the Python environment and download the local AI model suite:
-```bash
-cd services/ai-worker
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python download_models.py
+> ChronoX is **cloud-only** — there are no local model weights to download and no local LLM to run.
+
+### 2. Configure an AI provider
+Paste an API key into the in-app AI settings, or set a fallback in
+`services/core-backend/.env`:
 ```
+# GEMINI_API_KEY=...      # or OPENAI_API_KEY / ANTHROPIC_API_KEY / XAI_API_KEY
+```
+The in-app key takes priority over `.env`. **Never commit real keys** — `.env` is gitignored.
 
-### 3. Configure an AI provider
-ChronoX is provider-agnostic. Pick one:
-
-- **Cloud (recommended for vision):** paste an API key (Gemini · OpenAI · Anthropic · Grok) into the in-app AI settings, or set a fallback in `services/core-backend/.env` (`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY`). The in-app key takes priority. **Never commit real keys** — `.env` is gitignored.
-- **Local:** start Ollama and pull the agent model:
-  ```bash
-  ollama run qwen2.5:7b
-  ```
-
-> Vision features (per-scene grading, curation, recipe extraction/match-up) need a vision-capable model — a cloud provider is recommended.
+### 3. (Optional) Media worker
+The Python worker only does FFmpeg/OpenCV scene sampling. Set it up if you want
+server-side scene detection:
+```bash
+cd services/ai-worker && python -m venv .venv
+source .venv/bin/activate && pip install -r requirements.txt
+```
 
 ### 4. Run the Dev Environment
 ChronoX is a monorepo managed with Turborepo. You can start all services (Next.js frontend, Rust backend, Python AI worker) with a single script from the repository root:
