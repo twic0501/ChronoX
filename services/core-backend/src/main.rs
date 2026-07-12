@@ -2349,16 +2349,22 @@ async fn vision_scenes_openai_compat(
             "image_url": {"url": format!("data:image/jpeg;base64,{}", strip_data_url(&s.image))}
         }));
     }
-    let req = serde_json::json!({
+    // Newer OpenAI models reject `max_tokens`/custom `temperature`; x.ai keeps them.
+    let is_openai = base_url.contains("api.openai.com");
+    let mut req = serde_json::json!({
         "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": content}
         ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.45,
-        "max_tokens": 2048
+        "response_format": {"type": "json_object"}
     });
+    if is_openai {
+        req["max_completion_tokens"] = serde_json::json!(2048);
+    } else {
+        req["temperature"] = serde_json::json!(0.45);
+        req["max_tokens"] = serde_json::json!(2048);
+    }
     let res = reqwest::Client::new()
         .post(base_url)
         .header("Authorization", format!("Bearer {}", key.trim()))
@@ -2887,7 +2893,7 @@ Input Reference Details: \
                 match key {
                     Ok(k) => {
                         let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
-                        agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &serde_json::json!([])).await
+                        agent_step_openai_compat(&model, "https://api.openai.com/v1/chat/completions", &k, &messages, &serde_json::json!([])).await
                     }
                     Err(e) => Err(e),
                 }
@@ -3027,7 +3033,7 @@ async fn synthesize_sources_handler(
             match key {
                 Ok(k) => {
                     let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
-                    agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &serde_json::json!([])).await
+                    agent_step_openai_compat(&model, "https://api.openai.com/v1/chat/completions", &k, &messages, &serde_json::json!([])).await
                 }
                 Err(e) => Err(e),
             }
@@ -3435,7 +3441,7 @@ Output the JSON block containing the operations: {{\"operations\": [...]}}. Only
                 match key {
                     Ok(k) => {
                         let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
-                        agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &tools).await
+                        agent_step_openai_compat(&model, "https://api.openai.com/v1/chat/completions", &k, &messages, &tools).await
                     }
                     Err(e) => Err(e),
                 }
@@ -3523,10 +3529,22 @@ async fn agent_step_openai_compat(
     messages: &serde_json::Value,
     tools: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let payload = serde_json::json!({
-        "model": model, "messages": messages, "tools": tools,
-        "temperature": 0.2, "max_tokens": 1024
-    });
+    // Newer OpenAI models (o-series, gpt-5.x) reject `max_tokens` (want
+    // `max_completion_tokens`) and a custom `temperature`. x.ai/Grok keeps the
+    // classic params. Also omit an empty `tools` array (OpenAI rejects it).
+    let is_openai = url.contains("api.openai.com");
+    let mut payload = serde_json::json!({ "model": model, "messages": messages });
+    if let Some(arr) = tools.as_array() {
+        if !arr.is_empty() {
+            payload["tools"] = tools.clone();
+        }
+    }
+    if is_openai {
+        payload["max_completion_tokens"] = serde_json::json!(1024);
+    } else {
+        payload["temperature"] = serde_json::json!(0.2);
+        payload["max_tokens"] = serde_json::json!(1024);
+    }
     let client = reqwest::Client::new();
     let res = client
         .post(url)
