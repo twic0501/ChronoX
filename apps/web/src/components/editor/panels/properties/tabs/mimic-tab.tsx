@@ -40,6 +40,48 @@ import {
 	Settings,
 } from "lucide-react";
 
+// Grab one downscaled frame (base64 JPEG, no data-URL prefix) from a media
+// source URL at `timeSec`, for the vision match-up when a card is dropped.
+async function grabOneFrame(
+	src: string,
+	timeSec: number,
+	maxW = 512,
+): Promise<string | null> {
+	return new Promise((resolve) => {
+		const v = document.createElement("video");
+		v.muted = true;
+		v.crossOrigin = "anonymous";
+		v.preload = "auto";
+		let done = false;
+		const fin = (x: string | null) => {
+			if (done) return;
+			done = true;
+			v.removeAttribute("src");
+			v.load();
+			resolve(x);
+		};
+		v.onerror = () => fin(null);
+		setTimeout(() => fin(null), 8000);
+		v.onloadedmetadata = () => {
+			const dur = v.duration || timeSec + 1;
+			v.onseeked = () => {
+				try {
+					const s = Math.min(1, maxW / (v.videoWidth || maxW));
+					const c = document.createElement("canvas");
+					c.width = Math.max(1, Math.round((v.videoWidth || maxW) * s));
+					c.height = Math.max(1, Math.round((v.videoHeight || maxW) * s));
+					c.getContext("2d")?.drawImage(v, 0, 0, c.width, c.height);
+					fin(c.toDataURL("image/jpeg", 0.8).split(",")[1] || null);
+				} catch {
+					fin(null);
+				}
+			};
+			v.currentTime = Math.max(0, Math.min(timeSec, dur - 0.05));
+		};
+		v.src = src;
+	});
+}
+
 export function MimicTab() {
 	const editor = useEditor();
 	const tracks = useEditor((e) => e.timeline.getTracks());
@@ -117,7 +159,7 @@ export function MimicTab() {
 				if (saved) return JSON.parse(saved);
 			} catch {}
 		}
-		return { provider: "ollama", model: "qwen3.5:9b", apiKey: "" };
+		return { provider: "gemini", model: "gemini-2.5-flash", apiKey: "" };
 	};
 
 	// --- 3. Style Preset Extraction Flow ---
@@ -166,7 +208,7 @@ export function MimicTab() {
 					description: description,
 					provider: aiCfg.provider,
 					api_key: aiCfg.apiKey || undefined,
-					model: aiCfg.provider === "ollama" ? "qwen3.5:9b" : aiCfg.model,
+					model: aiCfg.model,
 				}),
 			});
 
@@ -273,6 +315,71 @@ export function MimicTab() {
 				recipeWithRange = `[APPLY TARGET: Reference Video Time Range ${card.timeRange[0]}s to ${card.timeRange[1]}s]\n\n${recipeText}`;
 			}
 
+			// Vision match-up: grab a frame of the target source clip so the
+			// backend can adapt the technique to THIS footage, not copy blindly.
+			let targetFrame: string | null = null;
+			try {
+				const allTracks = editor.timeline.getTracks();
+				let clip: any = null;
+				if (targetClipId) {
+					for (const t of allTracks) {
+						const f = t.elements.find((e: any) => e.id === targetClipId);
+						if (f) {
+							clip = f;
+							break;
+						}
+					}
+				}
+				if (!clip) {
+					const vt = allTracks.find((t: any) => t.type === "video");
+					clip = vt?.elements?.[0];
+				}
+				if (clip) {
+					const asset = editor.media
+						.getAssets()
+						.find((a: any) => a.id === clip.mediaId);
+					const src =
+						asset?.url ||
+						(asset?.file ? URL.createObjectURL(asset.file) : null);
+					if (src) {
+						const rate = clip.retime?.rate ?? 1;
+						const mid =
+							(clip.trimStart ?? 0) + ((clip.duration ?? 0) * rate) / 2;
+						targetFrame = await grabOneFrame(src, mid);
+					}
+				}
+			} catch {}
+
+			// RAG-ground: pull the editor's skill recipe(s) for this card's
+			// technique so keyframed builds (zoom/bounce/punch, transitions)
+			// follow the documented property paths/presets, not improvisation.
+			let skillsContext = "";
+			try {
+				const { SKILLS } = await import("@/lib/ai/skills");
+				const want = new Set<string>();
+				if (card.category === "color") want.add("color-grading");
+				else if (card.category === "transitions") {
+					want.add("transitions");
+					want.add("cut-types");
+				} else if (card.category === "pacing") {
+					want.add("pacing-montage");
+					want.add("beat-sync");
+				} else if (card.category === "effects") want.add("transform-animation");
+				const text = `${card.name} ${card.summary} ${recipeText}`.toLowerCase();
+				if (/zoom|bounce|punch|push.?in|ken.?burns|parallax|pop.?in|shake|scale|transform|slide|spin/.test(text))
+					want.add("transform-animation");
+				if (/whip|dissolve|dip|crossfade|transition|wipe|fade/.test(text))
+					want.add("transitions");
+				if (/grid|split.?screen|mask|collage/.test(text)) want.add("masks-grid");
+				if (/beat|bpm|sync|rhythm|tempo/.test(text)) want.add("beat-sync");
+				const parts: string[] = [];
+				for (const n of [...want].slice(0, 3)) {
+					const s = (SKILLS as any[]).find((x) => x.name === n);
+					if (s?.content) parts.push(`## Skill: ${n}\n${s.content}`);
+				}
+				skillsContext = parts.join("\n\n---\n\n");
+			} catch {}
+
 			const res = await fetch(`${API_URL}/api/ai/apply-recipe`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -280,9 +387,11 @@ export function MimicTab() {
 					recipe: recipeWithRange,
 					timeline_state: timelineState,
 					target_clip_id: targetClipId,
+					target_frame: targetFrame || undefined,
+					skills_context: skillsContext || undefined,
 					provider: aiCfg.provider,
 					api_key: aiCfg.apiKey || undefined,
-					model: aiCfg.provider === "ollama" ? "qwen3.5:9b" : aiCfg.model,
+					model: aiCfg.model,
 				}),
 			});
 
@@ -405,8 +514,8 @@ export function MimicTab() {
 		try {
 			const searchable = `${op.action} operation on clip ${op.clip_id || "timeline"}${op.time ? ` at ${op.time.toFixed(1)}s` : ""}`;
 			const situation = {
-				the_loai: "general",
-				loai_quyet_dinh: op.action === "delete" || op.action === "split" ? "cut_hay_giữ" : "apply_effect",
+				genre: "general",
+				decision_type: op.action === "delete" || op.action === "split" ? "cut_or_keep" : "apply_effect",
 			};
 
 			const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";

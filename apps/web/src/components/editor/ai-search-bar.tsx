@@ -60,7 +60,7 @@ export function AiSearchBar() {
 		} catch (error) {
 			console.error("Semantic search error:", error);
 			toast.error("Search error", {
-				description: "Ollama nomic-embed-text is not responding, or the backend is not running.",
+				description: "Embedding service is not responding, or the backend is not running.",
 			});
 		} finally {
 			setIsSearching(false);

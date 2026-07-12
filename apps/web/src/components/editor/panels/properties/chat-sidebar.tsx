@@ -23,6 +23,7 @@ import {
 	Eye,
 	Trash2,
 	Sliders,
+	Link2,
 } from "lucide-react";
 import { useEditor } from "@/hooks/use-editor";
 import { toast } from "sonner";
@@ -204,6 +205,24 @@ export function buildTimelineSnapshot(editor: any): string {
 			const rate = (el as any).retime?.rate;
 			const volume = (el as any).volume;
 			const isMuted = (el as any).muted === true;
+
+			// Match video segments to their scene tag from the cached scene map
+			let sceneLabel = "";
+			if (track.type === "video" && (el as any).mediaId) {
+				const sm = getCachedSceneMap((el as any).mediaId);
+				if (sm && sm.scenes.length > 0) {
+					const trimStart = (el as any).trimStart ?? 0;
+					const rateVal = (el as any).retime?.rate ?? 1;
+					const srcMid = trimStart + (dur * rateVal) / 2;
+					const match = sm.scenes.find(
+						(s) => srcMid >= s.startTime && srcMid < s.endTime,
+					) ?? sm.scenes.find(
+						(s) => s.startTime < trimStart + dur * rateVal && s.endTime > trimStart,
+					);
+					if (match) sceneLabel = ` scene="${match.contentTag}"`;
+				}
+			}
+
 			const extras = [
 				typeof rate === "number" && rate !== 1 ? `speed=${rate}x` : null,
 				// volume is a linear gain: 0 = mute, 1 = normal, 2 = double
@@ -213,7 +232,7 @@ export function buildTimelineSnapshot(editor: any): string {
 				.filter(Boolean)
 				.join(" ");
 			lines.push(
-				`  - clip_id="${el.id}" type=${el.type} name="${name}" timeline=[${start.toFixed(1)}s → ${end.toFixed(1)}s] dur=${dur.toFixed(1)}s effects=[${effectsList}]${extras ? " " + extras : ""}`,
+				`  - clip_id="${el.id}" type=${el.type} name="${name}" timeline=[${start.toFixed(1)}s → ${end.toFixed(1)}s] dur=${dur.toFixed(1)}s effects=[${effectsList}]${sceneLabel}${extras ? " " + extras : ""}`,
 			);
 		}
 	});
@@ -456,14 +475,10 @@ export function ChatSidebar() {
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 	const [backendConnected, setBackendConnected] = useState(false);
-	const [localModel, setLocalModel] = useState<"qwen3.5:9b" | "gemma4:12b">(
-		"qwen3.5:9b",
-	);
 
 	// ── AI provider config: paste an API key in-app, the backend detects the
 	// vendor from the key format and returns that vendor's model list.
 	const PROVIDER_LABELS: Record<string, string> = {
-		ollama: "Local",
 		gemini: "Gemini",
 		openai: "OpenAI",
 		grok: "Grok",
@@ -487,9 +502,44 @@ export function ChatSidebar() {
 				}
 			} catch {}
 		}
-		return { provider: "ollama", model: "qwen3.5:9b", apiKey: "", models: [] };
+		return { provider: "gemini", model: "gemini-2.5-flash", apiKey: "", models: [] };
 	});
 	const [showProviderPanel, setShowProviderPanel] = useState(false);
+	const [showNotionPanel, setShowNotionPanel] = useState(false);
+	const [notionTokenInput, setNotionTokenInput] = useState("");
+	const [savedNotionToken, setSavedNotionToken] = useState("");
+
+	useEffect(() => {
+		if (typeof window !== "undefined") {
+			const tok = localStorage.getItem("chronox.notion.token") || "";
+			setSavedNotionToken(tok);
+			setNotionTokenInput(tok);
+		}
+	}, []);
+
+	const handleSaveNotionToken = () => {
+		const token = notionTokenInput.trim();
+		if (!token) {
+			toast.error("Please enter a valid Notion token");
+			return;
+		}
+		if (typeof window !== "undefined") {
+			localStorage.setItem("chronox.notion.token", token);
+			setSavedNotionToken(token);
+			toast.success("Notion token saved successfully");
+			setShowNotionPanel(false);
+		}
+	};
+
+	const handleClearNotionToken = () => {
+		if (typeof window !== "undefined") {
+			localStorage.removeItem("chronox.notion.token");
+			setSavedNotionToken("");
+			setNotionTokenInput("");
+			toast.success("Notion token removed");
+		}
+	};
+
 	const [agentMode, setAgentMode] = useState<boolean>(() => {
 		try {
 			if (typeof window !== "undefined") {
@@ -1196,9 +1246,8 @@ export function ChatSidebar() {
 					editor,
 					goal: userPrompt,
 					provider: aiCfg.provider,
-					model: aiCfg.provider === "ollama" ? localModel : aiCfg.model,
+					model: aiCfg.model,
 					apiKey: aiCfg.apiKey || undefined,
-					localModel,
 					signal: controller.signal,
 					onAskUser: (question, options) =>
 						new Promise<string>((resolve) => {
@@ -1323,17 +1372,29 @@ export function ChatSidebar() {
 					prompt: userPrompt,
 					project_id: activeProject?.metadata.id || "default",
 					mode: aiMode,
-					local_model: localModel,
 					timeline_state: timelineState,
 					color_stats: colorStats,
 					scene_map: sceneMap,
 					provider: aiCfg.provider,
 					api_key: aiCfg.apiKey || undefined,
-					model: aiCfg.provider === "ollama" ? localModel : aiCfg.model,
+					model: aiCfg.model,
 				}),
 			});
 
-			if (!response.ok) throw new Error("Backend unreachable");
+			if (!response.ok) {
+				const errMsg = await response.text().catch(() => "Backend unreachable");
+				setIsThinking(false);
+				setAiStatus("idle", "");
+				setMessages((prev) => [
+					...prev,
+					{
+						id: crypto.randomUUID(),
+						role: "system",
+						content: `API Error: ${errMsg}`,
+					},
+				]);
+				return;
+			}
 
 			const reader = response.body?.getReader();
 			const decoder = new TextDecoder();
@@ -1659,7 +1720,11 @@ export function ChatSidebar() {
 				<div className="flex items-center gap-1.5">
 					<button
 						type="button"
-						onClick={() => setShowProviderPanel(!showProviderPanel)}
+						onClick={() => {
+							setShowProviderPanel(!showProviderPanel);
+							setShowNotionPanel(false);
+							setShowMimicDropdown(false);
+						}}
 						className={`text-[9px] px-2 py-0.5 rounded border bg-card cursor-pointer font-sans select-none transition-colors ${
 							showProviderPanel
 								? "border-primary/50 text-primary"
@@ -1668,15 +1733,31 @@ export function ChatSidebar() {
 						title="AI Provider — paste an API key to use a cloud model"
 					>
 						{PROVIDER_LABELS[aiCfg.provider] ?? aiCfg.provider} ·{" "}
-						{aiCfg.provider === "ollama" ? localModel : aiCfg.model}
+						{aiCfg.model}
 					</button>
 					<button
 						type="button"
-						onClick={() => setShowMimicDropdown(!showMimicDropdown)}
+						onClick={() => {
+							setShowMimicDropdown(!showMimicDropdown);
+							setShowProviderPanel(false);
+							setShowNotionPanel(false);
+						}}
 						className={`p-1 rounded border border-border hover:border-border bg-card text-muted-foreground hover:text-agent transition-colors cursor-pointer select-none ${showMimicDropdown ? "text-agent border-agent/50" : ""}`}
 						title="Mimic Reference Video Style Preset"
 					>
 						<Sparkles className="size-3" />
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							setShowNotionPanel(!showNotionPanel);
+							setShowProviderPanel(false);
+							setShowMimicDropdown(false);
+						}}
+						className={`p-1 rounded border border-border hover:border-border bg-card text-muted-foreground hover:text-agent transition-colors cursor-pointer select-none ${showNotionPanel ? "text-agent border-agent/50" : ""}`}
+						title="Notion MCP Integration"
+					>
+						<Link2 className="size-3" />
 					</button>
 					<button
 						type="button"
@@ -1712,7 +1793,7 @@ export function ChatSidebar() {
 						<div className="text-[9px] font-bold text-muted-foreground uppercase tracking-wider">
 							AI Provider
 						</div>
-						{aiCfg.provider !== "ollama" && aiCfg.apiKey && (
+						{aiCfg.apiKey && (
 							<span className="flex items-center gap-1 text-[9px] text-constructive">
 								<span className="size-1.5 rounded-full bg-constructive" />
 								Connected · key {aiCfg.apiKey.slice(0, 4)}…
@@ -1749,7 +1830,7 @@ export function ChatSidebar() {
 							{providerBusy ? "…" : "Connect"}
 						</button>
 					</div>
-					{aiCfg.provider !== "ollama" && aiCfg.models.length > 0 && (
+					{aiCfg.models.length > 0 && (
 						<div className="flex items-center gap-1.5">
 							<span className="text-muted-foreground shrink-0">
 								{PROVIDER_LABELS[aiCfg.provider] ?? aiCfg.provider} · model:
@@ -1765,45 +1846,6 @@ export function ChatSidebar() {
 									</option>
 								))}
 							</select>
-							<button
-								type="button"
-								onClick={() => {
-									saveAiCfg({
-										provider: "ollama",
-										model: localModel,
-										apiKey: "",
-										models: [],
-									});
-									toast.success("Switched to local AI (Ollama)");
-								}}
-								className="px-2 py-1 rounded border border-border text-muted-foreground hover:text-destructive hover:border-destructive transition-colors cursor-pointer shrink-0"
-								title="Clear the key and return to local AI"
-							>
-								Local
-							</button>
-						</div>
-					)}
-					{aiCfg.provider === "ollama" && (
-						<div className="flex items-center gap-1.5">
-							<span className="text-muted-foreground shrink-0">
-								Local · model:
-							</span>
-							<button
-								type="button"
-								onClick={() =>
-									setLocalModel(
-										localModel === "qwen3.5:9b" ? "gemma4:12b" : "qwen3.5:9b",
-									)
-								}
-								className="px-2 py-1 rounded border border-border bg-background text-foreground hover:border-border transition-colors cursor-pointer"
-							>
-								{localModel === "qwen3.5:9b"
-									? "Qwen 3.5 (9B)"
-									: "Gemma 4 (12B)"}
-							</button>
-							<span className="text-muted-foreground/60 italic">
-								Paste a key above to use a more powerful cloud model
-							</span>
 						</div>
 					)}
 				</div>
@@ -1833,6 +1875,64 @@ export function ChatSidebar() {
 								))}
 						</div>
 					)}
+				</div>
+			)}
+
+			{showNotionPanel && (
+				<div className="bg-card border-b border-border p-2 text-[10px] space-y-2 shrink-0">
+					<div className="flex items-center justify-between">
+						<div className="text-[9px] font-bold text-muted-foreground uppercase tracking-wider">
+							Notion Integration
+						</div>
+						{savedNotionToken && (
+							<span className="flex items-center gap-1 text-[9px] text-constructive">
+								<span className="size-1.5 rounded-full bg-constructive animate-pulse" />
+								Connected
+							</span>
+						)}
+					</div>
+					<div className="flex gap-1.5">
+						<input
+							type="password"
+							value={notionTokenInput}
+							onChange={(e) => setNotionTokenInput(e.target.value)}
+							onKeyDown={(e) => {
+								if (e.key === "Enter") {
+									handleSaveNotionToken();
+								}
+							}}
+							placeholder={
+								savedNotionToken
+									? "secret_••••••••••••"
+									: "Enter Notion Token (secret_...)"
+							}
+							className="flex-1 bg-background border border-border rounded px-2 py-1 text-[10px] text-foreground placeholder:text-muted-foreground/70 focus:outline-none focus:border-primary/50"
+						/>
+						<button
+							type="button"
+							onClick={handleSaveNotionToken}
+							className="px-2 py-1 rounded border border-primary bg-primary/10 text-primary hover:bg-primary/20 transition-colors cursor-pointer"
+						>
+							Save
+						</button>
+						{savedNotionToken && (
+							<button
+								type="button"
+								onClick={handleClearNotionToken}
+								className="px-2 py-1 rounded border border-destructive bg-destructive/10 text-destructive hover:bg-destructive/20 transition-colors cursor-pointer"
+							>
+								Clear
+							</button>
+						)}
+					</div>
+					<div className="text-[9px] text-muted-foreground/80 leading-normal space-y-1">
+						<p>To connect Notion pages:</p>
+						<ol className="list-decimal pl-4 space-y-0.5 text-muted-foreground/70">
+							<li>Create an integration token at <a href="https://www.notion.so/my-integrations" target="_blank" rel="noreferrer" className="text-primary hover:underline">notion.so/my-integrations</a></li>
+							<li>Add the integration connection to your target page in Notion.</li>
+							<li>Ask Copilot: <span className="text-foreground">"load the brief from the Notion page 'Page Name'"</span></li>
+						</ol>
+					</div>
 				</div>
 			)}
 

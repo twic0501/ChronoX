@@ -283,6 +283,6 @@ export function formatSceneMapForPrompt(
 		lines.push(``);
 	}
 
-	lines.push(`=== HẾT PHÂN TÍCH ===`);
+	lines.push(`=== END ANALYSIS ===`);
 	return lines.join("\n");
 }

@@ -219,43 +219,13 @@ export class ProjectManager {
 		this.exportState = { isExporting: true, progress: 0, result: null };
 		this.notify();
 
-		const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+		// PRIMARY: WYSIWYG browser render. It renders the exact preview scene
+		// graph frame-by-frame (colour grades, per-clip effects, transforms,
+		// keyframe animations like zoom/bounce, adjustment layers, transitions)
+		// and honours the export options (resolution / fps / format / quality).
+		// The ffmpeg backend only does trim+concat+colour, so it silently drops
+		// most of the edit — that is why exports "didn't reflect" the timeline.
 		try {
-			const response = await fetch(`${API_URL}/api/project/export`, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					project: this.active,
-				}),
-			});
-
-			if (!response.ok) {
-				throw new Error(`Backend export failed: ${response.statusText}`);
-			}
-
-			const data = await response.json();
-			if (data.status === "success" && data.url) {
-				const fileResponse = await fetch(`${API_URL}${data.url}`);
-				const buffer = await fileResponse.arrayBuffer();
-
-				const result = { success: true, buffer };
-				this.exportState = {
-					isExporting: false,
-					progress: 100,
-					result: result as any,
-				};
-				this.notify();
-				return result as any;
-			} else {
-				throw new Error(data.error || "Unknown export error");
-			}
-		} catch (error: any) {
-			console.error(
-				"Master export failed, falling back to local canvas exporter...",
-				error,
-			);
 			const result = await this.editor.renderer.exportProject({
 				options,
 				onProgress: ({ progress }) => {
@@ -264,15 +234,40 @@ export class ProjectManager {
 				},
 				onCancel: () => this.exportCancelRequested,
 			});
-
-			this.exportState = {
-				isExporting: false,
-				progress: this.exportState.progress,
-				result,
-			};
+			if (!result || (result as any).success === false) {
+				throw new Error((result as any)?.error || "Renderer export produced no output");
+			}
+			this.exportState = { isExporting: false, progress: 100, result };
 			this.notify();
-
 			return result;
+		} catch (error: any) {
+			if (this.exportCancelRequested) {
+				this.exportState = { isExporting: false, progress: this.exportState.progress, result: null };
+				this.notify();
+				throw error;
+			}
+			// FALLBACK: server-side ffmpeg (fast, but not WYSIWYG) for browsers
+			// without WebCodecs or when the renderer fails.
+			console.error("Browser export failed, falling back to backend ffmpeg exporter...", error);
+			const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+			const response = await fetch(`${API_URL}/api/project/export`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ project: this.active }),
+			});
+			if (!response.ok) {
+				throw new Error(`Backend export failed: ${response.statusText}`);
+			}
+			const data = await response.json();
+			if (data.status === "success" && data.url) {
+				const fileResponse = await fetch(`${API_URL}${data.url}`);
+				const buffer = await fileResponse.arrayBuffer();
+				const result = { success: true, buffer };
+				this.exportState = { isExporting: false, progress: 100, result: result as any };
+				this.notify();
+				return result as any;
+			}
+			throw new Error(data.error || "Unknown export error");
 		}
 	}
 

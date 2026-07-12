@@ -45,7 +45,12 @@ export const colorAdjustEffectDefinition: EffectDefinition = {
 						u_contrast: getNum("contrast", 0),
 						u_saturation: getNum("saturation", 0),
 						u_exposure: getNum("exposure", 0),
-						u_temperature: getNum("temperature", 0),
+						// `warmth` is an alias the AI agent (adjust_color) and
+						// style-mimic pipeline emit; the shader only knows
+						// `temperature`. Fall back to warmth so per-scene
+						// warm/cool grading from the AI actually renders instead
+						// of silently no-op-ing (all scenes looked identical).
+						u_temperature: getNum("temperature", getNum("warmth", 0)),
 						u_tint: getNum("tint", 0),
 						u_highlights: getNum("highlights", 0),
 						u_shadows: getNum("shadows", 0),

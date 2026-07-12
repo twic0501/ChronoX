@@ -9,7 +9,9 @@ import {
         MoveElementCommand,
 } from "@/lib/commands/timeline/element";
 import {
-        UpsertEffectParamKeyframeCommand
+        UpsertEffectParamKeyframeCommand,
+        UpsertKeyframeCommand,
+        RemoveKeyframeCommand,
 } from "@/lib/commands/timeline/element/keyframes";
 import { UpdateElementRetimeCommand } from "@/lib/commands/timeline/element/retime/update-element-retime";
 import { AddClipEffectCommand } from "@/lib/commands/timeline/element/effects/add-effect";
@@ -443,7 +445,15 @@ export function compileActionDetailed(
                         // element.effects (same path the Adjustment tab uses).
                         // Writing element.params here was a visual no-op.
                         if (!clipId || !trackId) return fail("No target clip for color adjustment.");
-                        const params = op.params || {};
+                        const params = { ...(op.params || {}) };
+                        // The AI's adjust_color tool exposes `warmth`, but the
+                        // color-adjust effect/shader key is `temperature`. Alias
+                        // it so warm/cool per-scene grading is not dropped.
+                        if (params.warmth !== undefined && params.temperature === undefined) {
+                                params.temperature = params.warmth;
+                                delete params.warmth;
+                                fixes.push("mapped color param warmth → temperature");
+                        }
                         const existing = ((element as any)?.effects ?? []).find(
                                 (ef: any) => ef.type === "color-adjust"
                         );
@@ -747,6 +757,107 @@ export function compileActionDetailed(
                                                 opacity,
                                                 blendMode,
                                         } as any,
+                                })
+                        );
+                }
+                case "upsert_keyframe": {
+                        if (!clipId || !trackId) return fail("No target clip for keyframe upsert.");
+                        const prop = String(op.property || "").toLowerCase();
+                        let propertyPath: any = prop;
+                        if (prop === "scale") {
+                                propertyPath = "transform.scaleX";
+                        } else if (prop === "rotate" || prop === "rotation") {
+                                propertyPath = "transform.rotate";
+                        } else if (prop === "x" || prop === "position_x") {
+                                propertyPath = "transform.position.x";
+                        } else if (prop === "y" || prop === "position_y") {
+                                propertyPath = "transform.position.y";
+                        } else if (prop === "opacity") {
+                                propertyPath = "opacity";
+                        }
+                        const keyframe = op.keyframe || {};
+                        const kfId = keyframe.id || `kf-${Math.random().toString(36).substr(2, 9)}`;
+                        const time = typeof keyframe.time === "number" ? keyframe.time : 0.0;
+                        const value = typeof keyframe.value === "number" ? keyframe.value : 0.0;
+                        const interpolation = keyframe.interpolation || "linear";
+
+                        if (prop === "scale") {
+                                return ok(
+                                        new BatchCommand([
+                                                new UpsertKeyframeCommand({
+                                                        trackId,
+                                                        elementId: clipId,
+                                                        propertyPath: "transform.scaleX",
+                                                        time,
+                                                        value,
+                                                        interpolation,
+                                                        keyframeId: kfId + "-x",
+                                                }),
+                                                new UpsertKeyframeCommand({
+                                                        trackId,
+                                                        elementId: clipId,
+                                                        propertyPath: "transform.scaleY",
+                                                        time,
+                                                        value,
+                                                        interpolation,
+                                                        keyframeId: kfId + "-y",
+                                                }),
+                                        ])
+                                );
+                        }
+
+                        return ok(
+                                new UpsertKeyframeCommand({
+                                        trackId,
+                                        elementId: clipId,
+                                        propertyPath,
+                                        time,
+                                        value,
+                                        interpolation,
+                                        keyframeId: kfId,
+                                })
+                        );
+                }
+                case "delete_keyframe": {
+                        if (!clipId || !trackId) return fail("No target clip for keyframe deletion.");
+                        const prop = String(op.property || "").toLowerCase();
+                        let propertyPath: any = prop;
+                        if (prop === "scale") {
+                                propertyPath = "transform.scaleX";
+                        } else if (prop === "rotate" || prop === "rotation") {
+                                propertyPath = "transform.rotate";
+                        } else if (prop === "x" || prop === "position_x") {
+                                propertyPath = "transform.position.x";
+                        } else if (prop === "y" || prop === "position_y") {
+                                propertyPath = "transform.position.y";
+                        } else if (prop === "opacity") {
+                                propertyPath = "opacity";
+                        }
+                        const kfId = op.keyframe_id || op.keyframeId || "";
+                        if (prop === "scale") {
+                                return ok(
+                                        new BatchCommand([
+                                                new RemoveKeyframeCommand({
+                                                        trackId,
+                                                        elementId: clipId,
+                                                        propertyPath: "transform.scaleX",
+                                                        keyframeId: kfId + "-x",
+                                                }),
+                                                new RemoveKeyframeCommand({
+                                                        trackId,
+                                                        elementId: clipId,
+                                                        propertyPath: "transform.scaleY",
+                                                        keyframeId: kfId + "-y",
+                                                }),
+                                        ])
+                                );
+                        }
+                        return ok(
+                                new RemoveKeyframeCommand({
+                                        trackId,
+                                        elementId: clipId,
+                                        propertyPath,
+                                        keyframeId: kfId,
                                 })
                         );
                 }

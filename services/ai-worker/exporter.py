@@ -3,6 +3,102 @@ import sys
 import json
 import subprocess
 
+
+def _num(params, key, default=0.0):
+    v = params.get(key, default)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _color_adjust_filter(params):
+    """Translate a color-adjust effect's params into an FFmpeg filter chain.
+
+    The browser preview grades via a WebGL shader (color_adjust.frag.glsl);
+    the exported file must reproduce it or every scene keeps its original
+    look ("all scenes same colour"). This is a close FFmpeg approximation of
+    that shader using `eq` (brightness/contrast/saturation/exposure) and
+    `colorbalance` (lift→shadows, gain→highlights, temperature→r/b split).
+    """
+    parts = []
+
+    brightness = _num(params, "brightness")
+    contrast = _num(params, "contrast")
+    saturation = _num(params, "saturation")
+    exposure = _num(params, "exposure")
+
+    eq = []
+    if abs(brightness) > 1e-3:
+        eq.append(f"brightness={_clamp(brightness, -1.0, 1.0):.4f}")
+    if abs(contrast) > 1e-3:
+        # shader: (rgb-0.5)*(1+contrast)+0.5  ≡  eq contrast=1+contrast
+        eq.append(f"contrast={_clamp(1.0 + contrast, 0.0, 2.0):.4f}")
+    if abs(saturation) > 1e-3:
+        eq.append(f"saturation={_clamp(1.0 + saturation, 0.0, 3.0):.4f}")
+    if abs(exposure) > 1e-3:
+        # shader multiplies linear light by 2^exposure; approximate with gamma
+        eq.append(f"gamma={_clamp(1.0 / (2.0 ** exposure), 0.1, 10.0):.4f}")
+    if eq:
+        parts.append("eq=" + ":".join(eq))
+
+    # Temperature / warmth: shader shifts R up and B down. `warmth` is the
+    # alias the AI agent emits; `temperature` is the canonical key.
+    temp = _num(params, "temperature") or _num(params, "warmth")
+    tint = _num(params, "tint")
+
+    # Lift (shadows offset) and Gain (highlights scale, 1.0 = neutral) → the
+    # shadow/highlight bands of colorbalance (additive, -1..1).
+    rs = _num(params, "lift_r")
+    gs = _num(params, "lift_g")
+    bs = _num(params, "lift_b")
+    rh = _num(params, "gain_r", 1.0) - 1.0
+    gh = _num(params, "gain_g", 1.0) - 1.0
+    bh = _num(params, "gain_b", 1.0) - 1.0
+    # Fold temperature/tint into the midtones.
+    rm = temp * 0.5 - tint * 0.25
+    gm = tint * 0.5
+    bm = -temp * 0.5 - tint * 0.25
+
+    cb = {
+        "rs": rs, "gs": gs, "bs": bs,
+        "rm": rm, "gm": gm, "bm": bm,
+        "rh": rh, "gh": gh, "bh": bh,
+    }
+    cb_parts = [
+        f"{k}={_clamp(v, -1.0, 1.0):.4f}"
+        for k, v in cb.items()
+        if abs(v) > 1e-3
+    ]
+    if cb_parts:
+        parts.append("colorbalance=" + ":".join(cb_parts))
+
+    return ",".join(parts)
+
+
+def _effects_filter(el):
+    """Build the FFmpeg filter suffix for an element's visual effects.
+
+    Currently maps the color-adjust grade (the one the AI applies per scene).
+    Other GPU-only effects are ignored gracefully rather than failing export.
+    """
+    chain = []
+    for ef in (el.get("effects") or []):
+        if not isinstance(ef, dict):
+            continue
+        if ef.get("enabled") is False:
+            continue
+        if ef.get("type") == "color-adjust":
+            f = _color_adjust_filter(ef.get("params") or {})
+            if f:
+                chain.append(f)
+    return ",".join(chain)
+
+
 def export_timeline(timeline_json_path, output_path):
     print(f"Loading timeline from {timeline_json_path}...")
     with open(timeline_json_path, 'r', encoding='utf-8') as f:
@@ -122,7 +218,13 @@ def export_timeline(timeline_json_path, output_path):
         
         if reverse:
             trim_filter += ",reverse"
-        
+
+        # Per-clip visual effects (color grade). Without this the export drops
+        # the AI's per-scene colour, leaving every scene its original look.
+        fx = _effects_filter(el)
+        if fx:
+            trim_filter += f",{fx}"
+
         filter_parts.append(f"{trim_filter}[{v_lbl}]")
         v_concat_inputs.append(f"[{v_lbl}]")
 

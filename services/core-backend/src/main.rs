@@ -259,6 +259,9 @@ async fn main() {
         .route("/api/ai/mimic-flow", post(ai_mimic_flow_handler))
         .route("/api/ai/scene-map", post(ai_scene_map_handler))
         .route("/api/ai/agent-step", post(agent_step_handler))
+        .route("/api/ai/grade-scenes", post(grade_scenes_handler))
+        .route("/api/ai/curate-scenes", post(curate_scenes_handler))
+        .route("/api/notion/brief", post(notion_brief_handler))
         .route("/api/ai/provider-models", post(provider_models_handler))
         .route("/api/ai/transcribe", post(ai_transcribe_handler))
         .route("/api/ai/detect-beats", post(ai_detect_beats_handler))
@@ -1262,6 +1265,7 @@ struct ExecuteResult {
 #[derive(Deserialize)]
 struct SearchParams {
     prompt: String,
+    api_key: Option<String>,
 }
 
 async fn ai_vector_search_handler(
@@ -1277,12 +1281,18 @@ async fn ai_vector_search_handler(
 
     let mut query_vector = vec![0.0f64; 512];
 
-    if let Ok(res) = client
-        .post("http://127.0.0.1:11434/api/embeddings")
-        .json(&embed_payload)
-        .send()
-        .await
-    {
+    let base_url = std::env::var("OLLAMA_API_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
+
+    let mut req = client.post(&url).json(&embed_payload);
+    if let Some(ref key) = params.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            req = req.header("Authorization", format!("Bearer {trimmed}"));
+        }
+    }
+
+    if let Ok(res) = req.send().await {
         if let Ok(body) = res.json::<serde_json::Value>().await {
             if let Some(embedding) = body.get("embedding").and_then(|e| e.as_array()) {
                 query_vector = embedding.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
@@ -1487,8 +1497,10 @@ struct WriteBackRequest {
 
 #[derive(Deserialize, Serialize, Debug)]
 struct QueryEpisodicRequest {
-    the_loai: Option<String>,
-    loai_quyet_dinh: Option<String>,
+    #[serde(alias = "the_loai")]
+    genre: Option<String>,
+    #[serde(alias = "loai_quyet_dinh")]
+    decision_type: Option<String>,
     query_text: String,
 }
 
@@ -1589,9 +1601,9 @@ async fn ai_query_episodic_handler(
     let mut matched_records = Vec::new();
     for r in records_iter {
         if let Ok(rec) = r {
-            // Apply pre-filter: the_loai and loai_quyet_dinh if specified
-            if let Some(ref filter_loai) = payload.the_loai {
-                if let Some(t) = rec.situation.get("the_loai").and_then(|x| x.as_str()) {
+            // Apply pre-filter: genre and decision_type if specified
+            if let Some(ref filter_loai) = payload.genre {
+                if let Some(t) = rec.situation.get("genre").or_else(|| rec.situation.get("the_loai")).and_then(|x| x.as_str()) {
                     if t != filter_loai {
                         continue;
                     }
@@ -1599,9 +1611,11 @@ async fn ai_query_episodic_handler(
                     continue;
                 }
             }
-            if let Some(ref filter_qd) = payload.loai_quyet_dinh {
-                if let Some(qd) = rec.situation.get("loai_quyet_dinh").and_then(|x| x.as_str()) {
-                    if qd != filter_qd {
+            if let Some(ref filter_qd) = payload.decision_type {
+                if let Some(qd) = rec.situation.get("decision_type").or_else(|| rec.situation.get("loai_quyet_dinh")).and_then(|x| x.as_str()) {
+                    let normalized_qd = if qd == "cut_hay_giữ" { "cut_or_keep" } else { qd };
+                    let normalized_filter = if filter_qd == "cut_hay_giữ" { "cut_or_keep" } else { filter_qd };
+                    if normalized_qd != normalized_filter {
                         continue;
                     }
                 } else {
@@ -1685,6 +1699,7 @@ async fn execute_ai_task(Json(params): Json<ExecuteParams>) -> impl IntoResponse
 #[derive(Deserialize)]
 struct VisionTagRequest {
     image: String,
+    api_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1708,12 +1723,22 @@ async fn vision_tag_handler(Json(params): Json<VisionTagRequest>) -> impl IntoRe
         "stream": false
     });
 
-    match client
-        .post("http://127.0.0.1:11434/api/chat")
-        .json(&payload)
-        .send()
-        .await
-    {
+    let base_url = std::env::var("OLLAMA_API_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+
+    let mut req = client.post(&url).json(&payload);
+    if let Some(ref key) = params.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            req = req.header("Authorization", format!("Bearer {trimmed}"));
+        }
+    } else if let Ok(env_key) = std::env::var("OLLAMA_API_KEY") {
+        if !env_key.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", env_key.trim()));
+        }
+    }
+
+    match req.send().await {
         Ok(res) => {
             if let Ok(body) = res.json::<serde_json::Value>().await {
                 let tag = body["message"]["content"]
@@ -1823,7 +1848,7 @@ Only these actions exist. NEVER invent other action names.
 - {"action":"add_subtitle","text":"...","start":0,"end":5}
 - {"action":"auto_scene_cut","clip_id":"<ID>","keep_only_scenery":false,"color_preset":"cinematic","mute":false}
   // IMPORTANT: Use this when the user wants to split/cut a clip into its natural scenes.
-  // - "keep_only_scenery": defaults to FALSE. ONLY set to TRUE if the user explicitly asks to remove people/talking shots or keep scenery/b-roll only. If they just ask to "phân cảnh" (split/detect scenes), keep_only_scenery MUST be FALSE!
+  // - "keep_only_scenery": defaults to FALSE. ONLY set to TRUE if the user explicitly asks to remove people/talking shots or keep scenery/b-roll only. If they just ask to split into scenes (split/detect scenes), keep_only_scenery MUST be FALSE!
   // - "mute": defaults to FALSE. Only set to TRUE if they ask to mute the clip.
   // - "color_preset": optional color preset name.
 - {"action":"voice_isolation","clip_id":"<ID>","enabled":true}
@@ -1834,6 +1859,17 @@ Only these actions exist. NEVER invent other action names.
   //   glitch: {"intensity":0.5}   letterbox: {"aspectRatio":2.39}   lut_grade: {"intensity":1.0,"logProfile":0,"lumaVsSatBottom":0.15}
   //   film_edge: {"depth":6,"roughness":9,"softness":1,"grain":15}   blur: {"radius":5}   vignette: {"intensity":0.5}
 - {"action":"adjust_color","clip_id":"<ID>","params":{"brightness":0.0,"contrast":0.0,"saturation":0.0,"exposure":0.0,"temperature":0.0,"tint":0.0,"highlights":0.0,"shadows":0.0,"lift_r":0.0,"lift_g":0.0,"lift_b":0.0,"gamma_r":1.0,"gamma_g":1.0,"gamma_b":1.0,"gain_r":1.0,"gain_g":1.0,"gain_b":1.0}}
+
+=== PER-SEGMENT COLOR GRADING (CRITICAL) ===
+When the user asks to grade each scene/segment with different colors:
+- Each clip in the CURRENT TIMELINE STATE may have a scene="..." attribute describing its visual content (e.g. "person talking", "landscape", "night cityscape").
+- You MUST emit a separate adjust_color operation for EACH clip with DIFFERENT color parameters tailored to the scene content:
+  * Scenes with "person"/"human"/"talking" → warm tones: positive temperature (0.1-0.3), gain_r > 1.0, gain_b < 1.0
+  * Scenes with "scenery"/"landscape"/"nature" → cool tones: negative temperature (-0.1 to -0.3), lift_b > 0, gain_b > 1.0
+  * Scenes with "action"/"sport"/"fast" → high contrast (0.2-0.3), desaturated slightly
+  * Scenes with "night"/"dark"/"indoor" → lift shadows (lift_r/g/b > 0), boost exposure
+  * Default/unknown → subtle cinematic grade
+- Do NOT apply the same parameters to all clips. Each clip_id must have visually distinct grading.
 
 === OUTPUT FORMAT ===
 Short explanation, then:
@@ -1950,12 +1986,12 @@ async fn chat_handler(
                 .and_then(detect_provider_from_key)
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "ollama".into());
+        .unwrap_or_else(|| "gemini".into());
 
     let messages_val = serde_json::json!(messages);
 
     if provider == "ollama" || provider == "local" {
-        let model_name = params.local_model.as_deref().unwrap_or("qwen3.5:9b");
+        let model_name = params.model.as_deref().unwrap_or("qwen3.5:9b");
         let payload = serde_json::json!({
             "model": model_name,
             "messages": messages_val,
@@ -1968,12 +2004,18 @@ async fn chat_handler(
             }
         });
 
-        let res = match client
-            .post("http://127.0.0.1:11434/api/chat")
-            .json(&payload)
-            .send()
-            .await
-        {
+        let base_url = std::env::var("OLLAMA_API_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+
+        let mut req = client.post(&url).json(&payload);
+        if let Some(ref key) = params.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                req = req.header("Authorization", format!("Bearer {trimmed}"));
+            }
+        }
+
+        let res = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -2140,6 +2182,358 @@ fn resolve_key(user_key: &Option<String>, env_name: &str) -> Result<String, Stri
         .map_err(|_| format!("No API key: paste a key in the app or set {env_name} in .env"))
 }
 
+// ─── Vision Colour Grading (multi-provider) ──────────────────
+// Sends each scene's actual frame to a vision LLM and lets it design a
+// bespoke, self-tuned grade per scene — no hardcoded presets or rules.
+
+#[derive(Deserialize, Debug)]
+struct SceneFrameInput {
+    index: i64,
+    #[serde(default)]
+    image: String, // base64 JPEG (data-URL prefix tolerated)
+    #[serde(default)]
+    hint: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct GradeScenesRequest {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    scenes: Vec<SceneFrameInput>,
+}
+
+fn colorist_system_prompt() -> String {
+    "You are a senior film colorist grading a montage. You are shown the scenes of one edit IN ORDER, each as a real frame image plus quick stats. \
+Design a colour grade for EACH scene that: (1) suits its actual light, subject and mood — look at the pixels; (2) is visibly DISTINCT from the scenes immediately before/after it so the montage has colour variety; (3) together with the others forms a cohesive, intentional palette. \
+Grade like DaVinci Resolve: subtle lift/gamma/gain, believable temperature/tint, gentle contrast and saturation. NEVER wash a heavy flat single-colour tint over the whole frame. \
+Return ONLY minified JSON, no prose, no code fences: {\"grades\":[{\"scene\":<index>,\"rationale\":\"<short reason>\",\"params\":{...}}]}. \
+params keys (all optional — omit neutral ones): brightness,contrast,saturation,exposure,temperature,tint,highlights,shadows,lift_r,lift_g,lift_b,gamma_r,gamma_g,gamma_b,gain_r,gain_g,gain_b. \
+Ranges: lift ±0.3, gamma 0.7–1.4, gain 0.7–1.4, contrast/saturation/temperature/tint ±0.5, exposure ±1. Provide one entry per scene, matching its index.".to_string()
+}
+
+fn strip_data_url(b64: &str) -> &str {
+    match b64.rfind("base64,") {
+        Some(i) => &b64[i + 7..],
+        None => b64,
+    }
+}
+
+/// Standard base64 encode (no external crate).
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(T[(b0 >> 2) as usize] as char);
+        out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Grab one frame from a video at `time` seconds as base64 JPEG (scaled to
+/// 512px wide) via ffmpeg piped to stdout — the "eyes" for recipe extraction.
+async fn extract_frame_b64(path: &str, time: f64) -> Option<String> {
+    let out = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-ss",
+            &format!("{:.3}", time),
+            "-i",
+            path,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=512:-1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    Some(b64_encode(&out.stdout))
+}
+
+/// Pull the first JSON object out of a model reply (tolerates fences/prose).
+fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        return Some(v);
+    }
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end > start {
+        serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+    } else {
+        None
+    }
+}
+
+async fn vision_scenes_gemini(
+    system: &str,
+    model: &str,
+    key: &str,
+    scenes: &[SceneFrameInput],
+) -> Result<String, String> {
+    let mut parts: Vec<serde_json::Value> = vec![serde_json::json!({
+        "text": "Here are the scenes in order."
+    })];
+    for s in scenes {
+        parts.push(serde_json::json!({"text": format!("Scene {}: {}", s.index, s.hint)}));
+        parts.push(serde_json::json!({
+            "inline_data": {"mime_type": "image/jpeg", "data": strip_data_url(&s.image)}
+        }));
+    }
+    let req = serde_json::json!({
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.45, "maxOutputTokens": 2048, "responseMimeType": "application/json"}
+    });
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        model
+    );
+    let res = reqwest::Client::new()
+        .post(&url)
+        .query(&[("key", &key)])
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| format!("gemini connect: {e}"))?;
+    let status = res.status();
+    let body: serde_json::Value = res.json().await.map_err(|e| format!("gemini parse: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("gemini {status}: {body}"));
+    }
+    body.pointer("/candidates/0/content/parts/0/text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("gemini: no text in response: {body}"))
+}
+
+async fn vision_scenes_openai_compat(
+    system: &str,
+    model: &str,
+    base_url: &str,
+    key: &str,
+    scenes: &[SceneFrameInput],
+) -> Result<String, String> {
+    let mut content: Vec<serde_json::Value> =
+        vec![serde_json::json!({"type": "text", "text": "Here are the scenes in order. Respond as json."})];
+    for s in scenes {
+        content.push(serde_json::json!({"type": "text", "text": format!("Scene {}: {}", s.index, s.hint)}));
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:image/jpeg;base64,{}", strip_data_url(&s.image))}
+        }));
+    }
+    let req = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.45,
+        "max_tokens": 2048
+    });
+    let res = reqwest::Client::new()
+        .post(base_url)
+        .header("Authorization", format!("Bearer {}", key.trim()))
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| format!("openai connect: {e}"))?;
+    let status = res.status();
+    let body: serde_json::Value = res.json().await.map_err(|e| format!("openai parse: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("openai {status}: {body}"));
+    }
+    body.pointer("/choices/0/message/content")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("openai: no content in response: {body}"))
+}
+
+async fn vision_scenes_anthropic(
+    system: &str,
+    model: &str,
+    key: &str,
+    scenes: &[SceneFrameInput],
+) -> Result<String, String> {
+    let mut content: Vec<serde_json::Value> =
+        vec![serde_json::json!({"type": "text", "text": "Here are the scenes in order. Output only the JSON object."})];
+    for s in scenes {
+        content.push(serde_json::json!({"type": "text", "text": format!("Scene {}: {}", s.index, s.hint)}));
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": strip_data_url(&s.image)}
+        }));
+    }
+    let req = serde_json::json!({
+        "model": model,
+        "max_tokens": 2048,
+        "system": system,
+        "messages": [{"role": "user", "content": content}]
+    });
+    let res = reqwest::Client::new()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", key.trim())
+        .header("anthropic-version", "2023-06-01")
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| format!("anthropic connect: {e}"))?;
+    let status = res.status();
+    let body: serde_json::Value = res.json().await.map_err(|e| format!("anthropic parse: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("anthropic {status}: {body}"));
+    }
+    body.pointer("/content/0/text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("anthropic: no text in response: {body}"))
+}
+
+fn curator_system_prompt() -> String {
+    "You are a sharp video editor reviewing raw footage before a cut. You are shown every scene of one clip IN ORDER, each as a real frame image plus quick stats. \
+For EACH scene decide whether to KEEP it or CUT it, judging from the actual image: CUT scenes that are out-of-focus/blurry, badly over- or under-exposed, essentially empty/black, shaky or throwaway, or near-duplicates of a neighbour you already kept. KEEP the sharp, well-exposed, visually interesting and varied shots that make the montage stronger. Be decisive but do NOT cut everything — always keep the strongest shots. \
+Return ONLY minified JSON, no prose, no code fences: {\"scenes\":[{\"scene\":<index>,\"keep\":true|false,\"score\":<0..1 quality>,\"reason\":\"<short>\"}]}. One entry per scene, matching its index.".to_string()
+}
+
+/// Shared multi-provider vision dispatch: sends the scene frames + a system
+/// prompt to the chosen provider's vision model and returns the raw reply text.
+async fn run_vision_scenes(
+    provider: &str,
+    model: &Option<String>,
+    api_key: &Option<String>,
+    system: &str,
+    scenes: &[SceneFrameInput],
+) -> Result<String, String> {
+    match provider {
+        "gemini" | "google" => {
+            let k = resolve_key(api_key, "GEMINI_API_KEY")?;
+            let m = model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+            vision_scenes_gemini(system, &m, &k, scenes).await
+        }
+        "openai" => {
+            let k = resolve_key(api_key, "OPENAI_API_KEY")?;
+            let m = model.clone().unwrap_or_else(|| "gpt-5.4-mini".into());
+            vision_scenes_openai_compat(system, &m, "https://api.openai.com/v1/chat/completions", &k, scenes).await
+        }
+        "grok" | "xai" => {
+            let k = resolve_key(api_key, "XAI_API_KEY")?;
+            let m = model.clone().unwrap_or_else(|| "grok-4-latest".into());
+            vision_scenes_openai_compat(system, &m, "https://api.x.ai/v1/chat/completions", &k, scenes).await
+        }
+        "anthropic" | "claude" => {
+            let k = resolve_key(api_key, "ANTHROPIC_API_KEY")?;
+            let m = model.clone().unwrap_or_else(|| "claude-haiku-4-5".into());
+            vision_scenes_anthropic(system, &m, &k, scenes).await
+        }
+        other => Err(format!("Unknown provider: {}", other)),
+    }
+}
+
+fn resolve_vision_provider(payload: &GradeScenesRequest) -> String {
+    payload
+        .provider
+        .clone()
+        .map(|p| p.to_lowercase())
+        .or_else(|| {
+            payload
+                .api_key
+                .as_deref()
+                .and_then(detect_provider_from_key)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "gemini".into())
+}
+
+async fn grade_scenes_handler(
+    State(_state): State<AppState>,
+    Json(payload): Json<GradeScenesRequest>,
+) -> impl IntoResponse {
+    if payload.scenes.is_empty() {
+        return Json(serde_json::json!({"error": "no scenes provided"})).into_response();
+    }
+    let provider = resolve_vision_provider(&payload);
+    let result = run_vision_scenes(
+        &provider,
+        &payload.model,
+        &payload.api_key,
+        &colorist_system_prompt(),
+        &payload.scenes,
+    )
+    .await;
+    match result {
+        Ok(text) => match extract_json_object(&text) {
+            Some(v) => {
+                println!("[grade-scenes] provider={} scenes={}", provider, payload.scenes.len());
+                Json(v).into_response()
+            }
+            None => Json(serde_json::json!({"error": "could not parse grades JSON", "raw": text})).into_response(),
+        },
+        Err(e) => {
+            println!("[grade-scenes] provider={} ERROR {}", provider, e);
+            Json(serde_json::json!({"error": e})).into_response()
+        }
+    }
+}
+
+async fn curate_scenes_handler(
+    State(_state): State<AppState>,
+    Json(payload): Json<GradeScenesRequest>,
+) -> impl IntoResponse {
+    if payload.scenes.is_empty() {
+        return Json(serde_json::json!({"error": "no scenes provided"})).into_response();
+    }
+    let provider = resolve_vision_provider(&payload);
+    let result = run_vision_scenes(
+        &provider,
+        &payload.model,
+        &payload.api_key,
+        &curator_system_prompt(),
+        &payload.scenes,
+    )
+    .await;
+    match result {
+        Ok(text) => match extract_json_object(&text) {
+            Some(v) => {
+                println!("[curate-scenes] provider={} scenes={}", provider, payload.scenes.len());
+                Json(v).into_response()
+            }
+            None => Json(serde_json::json!({"error": "could not parse curation JSON", "raw": text})).into_response(),
+        },
+        Err(e) => {
+            println!("[curate-scenes] provider={} ERROR {}", provider, e);
+            Json(serde_json::json!({"error": e})).into_response()
+        }
+    }
+}
+
 async fn agent_step_handler(
     State(_state): State<AppState>,
     Json(payload): Json<AgentStepRequest>,
@@ -2156,7 +2550,7 @@ async fn agent_step_handler(
                 .and_then(detect_provider_from_key)
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "ollama".into());
+        .unwrap_or_else(|| "gemini".into());
 
     let result = match provider.as_str() {
         "ollama" | "local" => {
@@ -2164,7 +2558,7 @@ async fn agent_step_handler(
                 .model
                 .or(payload.local_model)
                 .unwrap_or_else(|| "qwen3.5:9b".into());
-            agent_step_ollama(&model, &payload.messages, &payload.tools).await
+            agent_step_ollama(&model, &payload.messages, &payload.tools, payload.api_key.as_deref()).await
         }
         "gemini" | "google" => {
             let key = resolve_key(&payload.api_key, "GEMINI_API_KEY");
@@ -2307,8 +2701,11 @@ async fn extract_recipe_handler(
 ) -> impl IntoResponse {
     let mut title = "Custom Video Style".to_string();
     let mut author = "Unknown".to_string();
-    
+
     let mut visual_analysis = "No direct visual analysis metadata available.".to_string();
+    // For the vision path: resolved local video + (scene_index, midpoint, metadata).
+    let mut resolved_path: Option<String> = None;
+    let mut scene_mids: Vec<(usize, f64, String)> = Vec::new();
 
     if let Some(ref url) = params.url {
         let is_youtube = url.contains("youtube.com") || url.contains("youtu.be");
@@ -2332,6 +2729,7 @@ async fn extract_recipe_handler(
         } else {
             // Local reference file - run Mixpeek-style visual analyzer
             let resolved = resolve_static_path_to_abs(url);
+            resolved_path = Some(resolved.clone());
             let client = reqwest::Client::new();
             if let Ok(res) = client
                 .post("http://127.0.0.1:8001/api/ai/scene-map")
@@ -2361,6 +2759,14 @@ async fn extract_recipe_handler(
                             desc.push_str(&format!(
                                 "- Scene {} ({:.1}s - {:.1}s): tag={}, brightness={:.2}, contrast={:.2}, saturation={:.2}, warmth={:.2}, colors=[{}]\n",
                                 i, start, end, tag, brightness, contrast, saturation, warmth, dominant
+                            ));
+                            scene_mids.push((
+                                i,
+                                (start + end) / 2.0,
+                                format!(
+                                    "{:.1}s-{:.1}s tag={} brightness={:.2} contrast={:.2} saturation={:.2} warmth={:.2}",
+                                    start, end, tag, brightness, contrast, saturation, warmth
+                                ),
                             ));
                         }
                         if !desc.is_empty() {
@@ -2423,43 +2829,75 @@ Input Reference Details: \
         })
         .unwrap_or_else(|| "gemini".into());
 
-    let messages = serde_json::json!([
-        {
-            "role": "system",
-            "content": "You are a professional video editor and style recipe extractor."
-        },
-        {
-            "role": "user",
-            "content": prompt
+    // Vision path: attach a real frame from each scene so the model SEES the
+    // grade / transitions / motion / effects instead of guessing from numbers.
+    // Evenly sample up to 12 frames to bound cost and latency.
+    let mut scene_frames: Vec<SceneFrameInput> = Vec::new();
+    if let Some(ref path) = resolved_path {
+        let step = ((scene_mids.len() + 11) / 12).max(1);
+        for (idx, mid, meta) in scene_mids.iter().step_by(step) {
+            if let Some(img) = extract_frame_b64(path, *mid).await {
+                scene_frames.push(SceneFrameInput {
+                    index: *idx as i64,
+                    image: img,
+                    hint: meta.clone(),
+                });
+            }
         }
-    ]);
+    }
 
-    let recipe_result = match provider.as_str() {
-        "gemini" | "google" => {
-            let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
-            match key {
-                Ok(k) => {
-                    let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
-                    agent_step_gemini(&model, &k, &messages, &serde_json::json!([])).await
-                }
-                Err(e) => Err(e),
+    let recipe_result = if !scene_frames.is_empty() {
+        let vision_system = format!(
+            "{}\n\nIMPORTANT: A real frame from each listed scene is attached as an image, IN ORDER. LOOK at the frames to read the ACTUAL colour grade, the cuts/transitions between shots, camera motion (whip / zoom / push), transforms, letterbox aspect ratio, film grain and other effects. Base every card on what you actually SEE — never on the numbers alone.",
+            prompt
+        );
+        run_vision_scenes(
+            &provider,
+            &params.model,
+            &params.api_key,
+            &vision_system,
+            &scene_frames,
+        )
+        .await
+        .map(|text| serde_json::json!({ "content": text }))
+    } else {
+        let messages = serde_json::json!([
+            {
+                "role": "system",
+                "content": "You are a professional video editor and style recipe extractor."
+            },
+            {
+                "role": "user",
+                "content": prompt
             }
-        }
-        "openai" => {
-            let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
-            match key {
-                Ok(k) => {
-                    let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
-                    agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &serde_json::json!([])).await
+        ]);
+        match provider.as_str() {
+            "gemini" | "google" => {
+                let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+                        agent_step_gemini(&model, &k, &messages, &serde_json::json!([])).await
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
+            "openai" => {
+                let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+                        agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &serde_json::json!([])).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "ollama" | "local" => {
+                let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
+                agent_step_ollama(&model, &messages, &serde_json::json!([]), params.api_key.as_deref()).await
+            }
+            _ => Err(format!("Unsupported provider: {}", provider)),
         }
-        "ollama" | "local" => {
-            let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
-            agent_step_ollama(&model, &messages, &serde_json::json!([])).await
-        }
-        _ => Err(format!("Unsupported provider: {}", provider)),
     };
 
     match recipe_result {
@@ -2596,7 +3034,7 @@ async fn synthesize_sources_handler(
         }
         "ollama" | "local" => {
             let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
-            agent_step_ollama(&model, &messages, &serde_json::json!([])).await
+            agent_step_ollama(&model, &messages, &serde_json::json!([]), params.api_key.as_deref()).await
         }
         _ => Err(format!("Unsupported provider: {}", provider)),
     };
@@ -2649,6 +3087,158 @@ async fn mcp_timeline_handler(
         .into_response()
 }
 
+// ─── Notion brief reader ─────────────────────────────────────
+// ChronoX pulls an editing brief / script / plan out of Notion so the AI edits
+// to the user's intent. Reads a page (by id/url) or searches by query, then
+// flattens the blocks to Markdown. Token = a Notion internal integration secret
+// (request body, or NOTION_TOKEN in .env).
+
+#[derive(Deserialize, Debug)]
+struct NotionBriefRequest {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    page_id: Option<String>,
+}
+
+fn notion_extract_id(s: &str) -> String {
+    // Accept a raw id or a URL like notion.so/Title-<32hexnodashes>.
+    let tail = s.rsplit(['/', '-']).next().unwrap_or(s);
+    let hex: String = tail.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() == 32 {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+        )
+    } else {
+        s.to_string()
+    }
+}
+
+fn notion_blocks_to_md(results: &[serde_json::Value]) -> String {
+    let mut md = String::new();
+    for b in results {
+        let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let rich = b
+            .get(t)
+            .and_then(|o| o.get("rich_text"))
+            .and_then(|r| r.as_array());
+        let text = rich
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.get("plain_text").and_then(|p| p.as_str()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        match t {
+            "heading_1" => md.push_str(&format!("# {}\n", text)),
+            "heading_2" => md.push_str(&format!("## {}\n", text)),
+            "heading_3" => md.push_str(&format!("### {}\n", text)),
+            "bulleted_list_item" | "to_do" => md.push_str(&format!("- {}\n", text)),
+            "numbered_list_item" => md.push_str(&format!("1. {}\n", text)),
+            "quote" => md.push_str(&format!("> {}\n", text)),
+            "code" => md.push_str(&format!("```\n{}\n```\n", text)),
+            "paragraph" => {
+                if text.is_empty() {
+                    md.push('\n');
+                } else {
+                    md.push_str(&format!("{}\n", text));
+                }
+            }
+            _ if !text.is_empty() => md.push_str(&format!("{}\n", text)),
+            _ => {}
+        }
+    }
+    md
+}
+
+async fn notion_brief_handler(
+    State(_state): State<AppState>,
+    Json(params): Json<NotionBriefRequest>,
+) -> impl IntoResponse {
+    let token = match params
+        .token
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| std::env::var("NOTION_TOKEN").ok())
+    {
+        Some(t) => t,
+        None => {
+            return Json(serde_json::json!({
+                "error": "No Notion token: pass `token` or set NOTION_TOKEN in .env (a Notion internal integration secret, and share the page with that integration)."
+            }))
+            .into_response()
+        }
+    };
+    let client = reqwest::Client::new();
+    let ver = "2022-06-28";
+
+    // Resolve the page id: given directly, or search for the top matching page.
+    let mut page_id = params.page_id.as_ref().map(|p| notion_extract_id(p));
+    let mut title = String::new();
+    if page_id.is_none() {
+        let q = params.query.clone().unwrap_or_default();
+        let res = client
+            .post("https://api.notion.com/v1/search")
+            .header("Authorization", format!("Bearer {}", token.trim()))
+            .header("Notion-Version", ver)
+            .json(&serde_json::json!({
+                "query": q,
+                "filter": {"property": "object", "value": "page"},
+                "page_size": 1
+            }))
+            .send()
+            .await;
+        match res {
+            Ok(r) => {
+                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                if let Some(first) = body.pointer("/results/0") {
+                    page_id = first.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+                    title = first
+                        .pointer("/properties/title/title/0/plain_text")
+                        .or_else(|| first.pointer("/properties/Name/title/0/plain_text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            Err(e) => {
+                return Json(serde_json::json!({"error": format!("notion search: {e}")})).into_response()
+            }
+        }
+    }
+    let pid = match page_id {
+        Some(p) => p,
+        None => return Json(serde_json::json!({"error": "No matching Notion page found."})).into_response(),
+    };
+
+    // Fetch the page's block children and flatten to Markdown.
+    let url = format!("https://api.notion.com/v1/blocks/{}/children?page_size=100", pid);
+    let res = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .header("Notion-Version", ver)
+        .send()
+        .await;
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            if !status.is_success() {
+                return Json(serde_json::json!({"error": format!("notion {status}: {body}")})).into_response();
+            }
+            let empty = vec![];
+            let results = body.get("results").and_then(|r| r.as_array()).unwrap_or(&empty);
+            let markdown = notion_blocks_to_md(results);
+            println!("[notion-brief] page={} chars={}", pid, markdown.len());
+            Json(serde_json::json!({"page_id": pid, "title": title, "markdown": markdown})).into_response()
+        }
+        Err(e) => Json(serde_json::json!({"error": format!("notion blocks: {e}")})).into_response(),
+    }
+}
+
 async fn mcp_execute_handler(
     State(state): State<AppState>,
     Json(params): Json<McpExecuteRequest>,
@@ -2675,6 +3265,15 @@ struct ApplyRecipeRequest {
     timeline_state: serde_json::Value,
     tools: Option<serde_json::Value>,
     target_clip_id: Option<String>,
+    /// base64 JPEG of the target source clip — lets the model SEE the footage
+    /// and tune the technique's parameters to it (vision match-up).
+    #[serde(default)]
+    target_frame: Option<String>,
+    /// Authoritative editor skill recipes for the card's technique(s), retrieved
+    /// on the frontend (RAG-ground) so keyframed techniques like zoom/bounce are
+    /// built with the documented property paths/presets, not improvised.
+    #[serde(default)]
+    skills_context: Option<String>,
     api_key: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -2740,7 +3339,7 @@ async fn apply_recipe_handler(
         
         let mut ctx = String::new();
         for (i, (searchable, situation, decision, reason, _)) in matches.into_iter().take(4).enumerate() {
-            let genre = situation.get("the_loai").and_then(|x| x.as_str()).unwrap_or("general");
+            let genre = situation.get("genre").or_else(|| situation.get("the_loai")).and_then(|x| x.as_str()).unwrap_or("general");
             ctx.push_str(&format!(
                 "- Memory {} (Genre: {}): Context: \"{}\" -> User Decision: {}, Reason: \"{}\"\n",
                 i + 1, genre, searchable, decision, reason
@@ -2753,15 +3352,28 @@ async fn apply_recipe_handler(
         }
     };
 
+    let skills_block = match params.skills_context.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!(
+            "=== EDITOR SKILL RECIPES (AUTHORITATIVE — for keyframed/transform techniques like zoom/bounce/punch, follow these EXACT property paths, presets, keyframe times and value ranges instead of improvising) ===\n{}\n=== END EDITOR SKILL RECIPES ===\n\n",
+            s
+        ),
+        _ => String::new(),
+    };
+
     let user_content = format!(
         "=== TIMELINE STATE ===\n{}\n=== END TIMELINE STATE ===\n\n\
 === STYLE PRESET RECIPE ===\n{}\n=== END STYLE PRESET RECIPE ===\n\n\
+{}\
 === EPISODIC MEMORIES (PAST USER CORRECTIONS) ===\n{}\n=== END EPISODIC MEMORIES ===\n\n\
 {}\n\n\
 Read the style preset recipe and translate its instructions (color grading, pacing/cuts, transitions, effects/transforms) into concrete editor operations on the targeted clip(s)/timeline. \
+MOTION/ANIMATION RULE: for zoom, bounce, punch, push-in, ken-burns, shake, pop-in or any moving effect you MUST emit `upsert_keyframe` operations — one op PER keyframe — never a static `transform` (which sets a fixed value and does NOT animate). \
+upsert_keyframe shape: {{\"action\":\"upsert_keyframe\",\"clip_id\":\"<id>\",\"property\":\"scale\"|\"rotate\"|\"x\"|\"y\"|\"opacity\",\"keyframe\":{{\"time\":<seconds from clip start>,\"value\":<number>,\"interpolation\":\"linear\"}}}}. \
+Example bounce/punch (scale 1 -> 1.15 -> 1 over 0.25s) = THREE ops: time 0.0 value 1.0, time 0.12 value 1.15, time 0.25 value 1.0 (all property \"scale\"). Example push-in/ken-burns = two scale keyframes across the clip (time 0 value 1.0, time <clip end> value 1.1). Properties animating together must share the same keyframe times. \
 Output the JSON block containing the operations: {{\"operations\": [...]}}. Only use valid actions from the schema.",
         params.timeline_state,
         params.recipe,
+        skills_block,
         episodic_context,
         target_msg
     );
@@ -2782,43 +3394,58 @@ Output the JSON block containing the operations: {{\"operations\": [...]}}. Only
         })
         .unwrap_or_else(|| "gemini".into());
 
-    let messages = serde_json::json!([
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user",
-            "content": user_content
-        }
-    ]);
-
-    let result = match provider.as_str() {
-        "gemini" | "google" => {
-            let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
-            match key {
-                Ok(k) => {
-                    let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
-                    agent_step_gemini(&model, &k, &messages, &tools).await
+    // Vision match-up: if the frontend sent a frame of the target source clip,
+    // let the model SEE it and tune the technique to this footage instead of
+    // copying the reference blindly. Otherwise fall back to text-only mapping.
+    let result = if let Some(frame) = params
+        .target_frame
+        .as_ref()
+        .filter(|f| !f.is_empty())
+    {
+        let vision_system = format!(
+            "{}\n\n{}\n\nThe attached image is a REAL frame from the TARGET source clip you are applying this recipe to. LOOK at it and adapt the technique's parameters (grade strength, effect intensity, transform amount, etc.) to fit THIS source's actual content, lighting and colour — do not copy the reference numbers blindly. Output only {{\"operations\":[...]}}.",
+            system_prompt, user_content
+        );
+        let scenes = vec![SceneFrameInput {
+            index: 0,
+            image: frame.clone(),
+            hint: "the target source clip being edited".into(),
+        }];
+        run_vision_scenes(&provider, &params.model, &params.api_key, &vision_system, &scenes)
+            .await
+            .map(|text| serde_json::json!({ "content": text }))
+    } else {
+        let messages = serde_json::json!([
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_content }
+        ]);
+        match provider.as_str() {
+            "gemini" | "google" => {
+                let key = resolve_key(&params.api_key, "GEMINI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "gemini-2.0-flash".into());
+                        agent_step_gemini(&model, &k, &messages, &tools).await
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
-        }
-        "openai" => {
-            let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
-            match key {
-                Ok(k) => {
-                    let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
-                    agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &tools).await
+            "openai" => {
+                let key = resolve_key(&params.api_key, "OPENAI_API_KEY");
+                match key {
+                    Ok(k) => {
+                        let model = params.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+                        agent_step_openai_compat(&model, &k, "https://api.openai.com/v1", &messages, &tools).await
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
+            "ollama" | "local" => {
+                let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
+                agent_step_ollama(&model, &messages, &tools, params.api_key.as_deref()).await
+            }
+            _ => Err(format!("Unsupported provider: {}", provider)),
         }
-        "ollama" | "local" => {
-            let model = params.model.clone().unwrap_or_else(|| "qwen3.5:9b".into());
-            agent_step_ollama(&model, &messages, &tools).await
-        }
-        _ => Err(format!("Unsupported provider: {}", provider)),
     };
 
     match result {
@@ -2848,11 +3475,12 @@ Output the JSON block containing the operations: {{\"operations\": [...]}}. Only
     }
 }
 
-// ── Local Ollama (native tool-calling; canonical format passes through) ──
+// ── Ollama API (native tool-calling; canonical format passes through) ──
 async fn agent_step_ollama(
     model: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
+    api_key: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let payload = serde_json::json!({
         "model": model, "messages": messages, "tools": tools,
@@ -2860,12 +3488,18 @@ async fn agent_step_ollama(
         "options": { "temperature": 0.2, "num_ctx": 8192 }
     });
     let client = reqwest::Client::new();
-    let res = client
-        .post("http://127.0.0.1:11434/api/chat")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("ollama connect: {e}"))?;
+    let base_url = std::env::var("OLLAMA_API_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+    
+    let mut req = client.post(&url).json(&payload);
+    if let Some(key) = api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            req = req.header("Authorization", format!("Bearer {trimmed}"));
+        }
+    }
+
+    let res = req.send().await.map_err(|e| format!("ollama connect: {e}"))?;
     let body: serde_json::Value = res
         .json()
         .await
@@ -3341,11 +3975,17 @@ async fn list_models_for(provider: &str, key: &str) -> Result<Vec<String>, Strin
     let client = reqwest::Client::new();
     match provider {
         "ollama" => {
-            let body: serde_json::Value = client
-                .get("http://127.0.0.1:11434/api/tags")
+            let base_url = std::env::var("OLLAMA_API_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+            let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+            let mut req = client.get(&url);
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                req = req.header("Authorization", format!("Bearer {trimmed}"));
+            }
+            let body: serde_json::Value = req
                 .send()
                 .await
-                .map_err(|e| format!("Ollama is not running: {e}"))?
+                .map_err(|e| format!("Ollama endpoint error: {e}"))?
                 .json()
                 .await
                 .map_err(|e| e.to_string())?;

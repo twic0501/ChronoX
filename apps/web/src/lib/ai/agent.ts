@@ -4,8 +4,9 @@
  * Instead of emitting one JSON blob of operations, the model is given a set of
  * high-level editing TOOLS (the app's features) and orchestrates them itself:
  * it calls one tool at a time, sees the real result, and decides the next step
- * until the goal is done. The backend `/api/ai/agent-step` is a thin Ollama
- * tool-call proxy; every tool below executes against the live timeline here.
+ * until the goal is done. The backend `/api/ai/agent-step` proxies to the
+ * configured provider (Gemini, OpenAI, Claude, Grok, Ollama); every tool
+ * below executes against the live timeline here.
  */
 
 import { getCachedSceneMap, analyzeScenesViaBackend } from "./scene-analyzer";
@@ -34,6 +35,132 @@ const CINEMATIC_GRADE = {
 	saturation: 0.05,
 };
 
+// Capture frames from ONE media source at several source-time offsets, as raw
+// base64 JPEGs (downscaled), for the vision colorist. Loads the video once and
+// seeks sequentially — reliable for many scenes cut from the same clip (a fresh
+// <video> per scene flakes out on repeated seeks). Returns an array aligned to
+// `times` (null where a seek/capture failed).
+async function captureFramesFromSource(
+	src: string,
+	times: number[],
+	maxW = 512,
+): Promise<(string | null)[]> {
+	return new Promise((resolve) => {
+		const video = document.createElement("video");
+		video.muted = true;
+		video.crossOrigin = "anonymous";
+		video.preload = "auto";
+		const out: (string | null)[] = new Array(times.length).fill(null);
+		const canvas = document.createElement("canvas");
+		let idx = 0;
+		let settled = false;
+		const cleanup = () => {
+			video.removeAttribute("src");
+			video.load();
+		};
+		const done = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(guard);
+			cleanup();
+			resolve(out);
+		};
+		// Overall cap scales with the number of seeks.
+		const guard = setTimeout(done, 5000 + times.length * 3000);
+		const seekNext = () => {
+			if (idx >= times.length) return done();
+			const dur = video.duration || times[idx] + 1;
+			video.currentTime = Math.max(0, Math.min(times[idx], dur - 0.05));
+		};
+		video.onseeked = () => {
+			try {
+				const scale = Math.min(1, maxW / (video.videoWidth || maxW));
+				canvas.width = Math.max(1, Math.round((video.videoWidth || maxW) * scale));
+				canvas.height = Math.max(1, Math.round((video.videoHeight || maxW) * scale));
+				canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
+				out[idx] = canvas.toDataURL("image/jpeg", 0.8).split(",")[1] || null;
+			} catch {
+				out[idx] = null;
+			}
+			idx++;
+			seekNext();
+		};
+		video.onerror = () => done();
+		video.onloadedmetadata = () => seekNext();
+		video.src = src;
+	});
+}
+
+// Extract one representative frame per video clip (in timeline order) as base64
+// JPEG, plus a text hint from the cached scene analysis. Shared by the vision
+// grading and vision curation tools. `indexToClip[i]` maps a scene index back
+// to its timeline clip.
+async function extractSceneFrames(editor: any): Promise<{
+	clips: any[];
+	scenes: Array<{ index: number; image: string; hint: string }>;
+	indexToClip: any[];
+}> {
+	const clips = clipsToTarget(editor)
+		.slice()
+		.sort((a: any, b: any) => (a.startTime ?? 0) - (b.startTime ?? 0));
+	const scenes: Array<{ index: number; image: string; hint: string }> = [];
+	const indexToClip: any[] = [];
+	if (clips.length === 0) return { clips, scenes, indexToClip };
+	const assets = editor.media.getAssets();
+	const bySrc = new Map<string, Array<{ i: number; mid: number }>>();
+	for (let i = 0; i < clips.length; i++) {
+		const clip = clips[i];
+		const asset = assets.find((a: any) => a.id === clip.mediaId);
+		const src =
+			asset?.url || (asset?.file ? URL.createObjectURL(asset.file) : null);
+		if (!src) continue;
+		const rate = clip.retime?.rate ?? 1;
+		const mid = (clip.trimStart ?? 0) + ((clip.duration ?? 0) * rate) / 2;
+		if (!bySrc.has(src)) bySrc.set(src, []);
+		bySrc.get(src)!.push({ i, mid });
+	}
+	for (const [src, entries] of bySrc) {
+		const frames = await captureFramesFromSource(
+			src,
+			entries.map((e) => e.mid),
+		);
+		entries.forEach((e, k) => {
+			const image = frames[k];
+			if (!image) return;
+			const clip = clips[e.i];
+			indexToClip[e.i] = clip;
+			const si = sceneInfoForSegment(editor, clip);
+			const hint = si
+				? `${si.tag}; brightness=${si.brightness?.toFixed?.(2) ?? "?"}; warmth=${si.warmth?.toFixed?.(2) ?? "?"}`
+				: "scene";
+			scenes.push({ index: e.i, image, hint });
+		});
+	}
+	scenes.sort((a, b) => a.index - b.index);
+	return { clips, scenes, indexToClip };
+}
+
+// POST scene frames to a backend vision endpoint using the app's saved AI config
+// (empty key → backend falls back to its .env key).
+async function callVisionScenes(path: string, scenes: any[]): Promise<any> {
+	let cfg: any = {};
+	try {
+		cfg = JSON.parse(localStorage.getItem("chronox.ai.cfg") || "{}");
+	} catch {}
+	const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+	const res = await fetch(`${API_URL}${path}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			provider: cfg.provider,
+			model: cfg.model,
+			api_key: cfg.apiKey,
+			scenes,
+		}),
+	});
+	return res.json();
+}
+
 export interface AgentEvent {
 	type: "tool" | "final" | "error" | "ask";
 	tool?: string;
@@ -44,7 +171,7 @@ export interface AgentEvent {
 }
 
 interface ToolDef {
-	schema: any; // Ollama function schema
+	schema: any; // OpenAI-compatible function schema
 	run: (args: any, editor: any) => Promise<string> | string;
 }
 
@@ -76,6 +203,36 @@ function sceneMapForClip(editor: any, clip: any) {
 	return asset ? getCachedSceneMap(asset.id) : undefined;
 }
 
+// Match a split segment's source time range to the cached scene map.
+// Returns the matching scene's contentTag and colorStats so the LLM knows
+// what each segment visually contains ("landscape", "person talking", etc.).
+function sceneInfoForSegment(
+	editor: any,
+	clip: any,
+): { tag: string; brightness?: number; warmth?: number; dominantColors?: string[] } | undefined {
+	const sm = sceneMapForClip(editor, clip);
+	if (!sm || sm.scenes.length === 0) return undefined;
+	// Segment's range in source-media time
+	const trimStart = clip.trimStart ?? 0;
+	const rate = clip.retime?.rate ?? 1;
+	const srcStart = trimStart;
+	const srcEnd = trimStart + (clip.duration ?? 0) * rate;
+	const srcMid = (srcStart + srcEnd) / 2;
+	// Find the scene whose time range covers the midpoint of this segment
+	const match = sm.scenes.find(
+		(s) => srcMid >= s.startTime && srcMid < s.endTime,
+	) ?? sm.scenes.find(
+		(s) => s.startTime < srcEnd && s.endTime > srcStart, // overlap fallback
+	);
+	if (!match) return undefined;
+	return {
+		tag: match.contentTag,
+		brightness: match.colorStats?.brightness,
+		warmth: match.colorStats?.warmth,
+		dominantColors: match.colorStats?.dominantColors,
+	};
+}
+
 // Like sceneMapForClip, but self-serves: if the cache is empty (e.g. after a
 // page reload), run the server-side analysis now and wait for it instead of
 // telling the model to "try again later".
@@ -97,22 +254,18 @@ async function ensureSceneMap(editor: any, clip: any) {
 	}
 }
 
-// Resolve which video clips a grade/mute should hit. A clip_id after a
-// scene-cut only names one segment, but the user means the whole source
-// footage — so expand to every segment sharing that clip's media. No clip_id
-// → all video clips.
+// Resolve which video clips a tool should hit.
+// When clip_id is provided, return ONLY that specific clip — do NOT expand
+// to siblings sharing the same mediaId. This is critical for per-segment
+// operations like individual color grading after a scene cut.
+// No clip_id → all video clips (for bulk operations like mute-all).
 function clipsToTarget(editor: any, clipId?: string): any[] {
 	const videoClips: any[] = [];
 	for (const t of editor.timeline.getTracks())
 		if (t.type === "video") videoClips.push(...t.elements);
 	if (!clipId) return videoClips;
 	const target = videoClips.find((c) => c.id === clipId);
-	if (!target) return [];
-	if (target.mediaId) {
-		const siblings = videoClips.filter((c) => c.mediaId === target.mediaId);
-		if (siblings.length > 0) return siblings;
-	}
-	return [target];
+	return target ? [target] : [];
 }
 
 async function runOps(editor: any, ops: any[]): Promise<number> {
@@ -147,28 +300,45 @@ const TOOLS: Record<string, ToolDef> = {
 			const clips: any[] = [];
 			for (const t of editor.timeline.getTracks()) {
 				for (const el of t.elements) {
-					clips.push({
+					const info: any = {
 						clip_id: el.id,
 						name: cleanName(el.name ?? el.type),
 						type: el.type,
 						track_type: t.type,
 						duration: Math.round(el.duration * 10) / 10,
-					});
+					};
+					// Annotate video segments with scene tag so the LLM
+					// knows what each segment visually contains.
+					if (t.type === "video") {
+						const si = sceneInfoForSegment(editor, el);
+						if (si) info.scene_tag = si.tag;
+					}
+					clips.push(info);
 				}
 			}
 			if (clips.length === 0)
 				return "The timeline is empty — no clips to edit.";
-			// Compact form: segments of the same source collapse into one line.
-			const bySource = new Map<string, any[]>();
-			for (const c of clips) {
-				const k = `${c.track_type}:${c.name}`;
-				if (!bySource.has(k)) bySource.set(k, []);
-				bySource.get(k)!.push(c);
-			}
+			// Compact form when >12 clips: only collapse audio segments.
+			// Video segments ALWAYS list their individual UUIDs so the LLM
+			// can target each one for per-segment color grading / effects.
 			if (clips.length > 12) {
+				const bySource = new Map<string, any[]>();
+				for (const c of clips) {
+					const k = `${c.track_type}:${c.name}`;
+					if (!bySource.has(k)) bySource.set(k, []);
+					bySource.get(k)!.push(c);
+				}
 				const lines: string[] = [];
 				for (const [k, group] of bySource) {
-					if (group.length === 1) {
+					if (group[0].track_type === "video") {
+						// Always list each video segment individually with scene tag
+						for (const c of group) {
+							const tag = c.scene_tag ? ` [${c.scene_tag}]` : "";
+							lines.push(
+								`${k}: clip_id ${c.clip_id}, ${c.duration}s (${c.type})${tag}`,
+							);
+						}
+					} else if (group.length === 1) {
 						const c = group[0];
 						lines.push(
 							`${k}: clip_id ${c.clip_id}, ${c.duration}s (${c.type})`,
@@ -176,13 +346,59 @@ const TOOLS: Record<string, ToolDef> = {
 					} else {
 						const total = group.reduce((s, c) => s + c.duration, 0);
 						lines.push(
-							`${k}: ${group.length} segments, total ${total.toFixed(1)}s, first clip_id ${group[0].clip_id} (pass any segment id — tools that act on the whole source expand it automatically)`,
+							`${k}: ${group.length} audio segments, total ${total.toFixed(1)}s`,
 						);
 					}
 				}
 				return lines.join("\n");
 			}
 			return JSON.stringify(clips);
+		},
+	},
+
+	load_brief_from_notion: {
+		schema: {
+			type: "function",
+			function: {
+				name: "load_brief_from_notion",
+				description:
+					"Read an editing brief, script, shot list or plan from the user's Notion, then follow it for the edit. Pass a Notion page URL/id as `page`, or a `query` to search the workspace (e.g. 'travel vlog brief'). Call this FIRST when the user says the plan/brief/script is in Notion, or asks to edit 'according to Notion / according to the brief'.",
+				parameters: {
+					type: "object",
+					properties: {
+						query: { type: "string", description: "Search text for the page" },
+						page: { type: "string", description: "Notion page URL or id" },
+					},
+				},
+			},
+		},
+		run: async (args, _editor) => {
+			let token = "";
+			try {
+				token = localStorage.getItem("chronox.notion.token") || "";
+			} catch {}
+			const API_URL =
+				process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+			let data: any;
+			try {
+				const res = await fetch(`${API_URL}/api/notion/brief`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						token: token || undefined,
+						query: args.query,
+						page_id: args.page,
+					}),
+				});
+				data = await res.json();
+			} catch (e: any) {
+				return `Notion request failed: ${e?.message ?? e}`;
+			}
+			if (!data || data.error)
+				return `Could not read the Notion brief: ${data?.error ?? "unknown error"}`;
+			const md = String(data.markdown || "").slice(0, 4000);
+			if (!md.trim()) return "The Notion page was empty.";
+			return `Editing brief from Notion${data.title ? ` "${data.title}"` : ""} — follow it for this edit:\n\n${md}`;
 		},
 	},
 
@@ -206,6 +422,27 @@ const TOOLS: Record<string, ToolDef> = {
 			const sm = await ensureSceneMap(editor, clip);
 			if (!sm || sm.scenes.length === 0)
 				return "Scene analysis failed for this clip — the source file may be missing on the server.";
+
+			// Segment-aware: if this is a split segment, find its matching scene
+			// and return specific visual details instead of generic counts.
+			const si = sceneInfoForSegment(editor, clip);
+			if (si) {
+				const parts: string[] = [
+					`This segment's visual content: "${si.tag}"`,
+				];
+				if (si.brightness !== undefined)
+					parts.push(`brightness=${si.brightness.toFixed(2)}`);
+				if (si.warmth !== undefined)
+					parts.push(`warmth=${si.warmth.toFixed(2)}`);
+				if (si.dominantColors && si.dominantColors.length > 0)
+					parts.push(`dominant colors: ${si.dominantColors.join(", ")}`);
+				parts.push(
+					`Suggestion: ${si.tag.includes("person") ? "Use warm tones (positive warmth, gain_r > 1.0)" : "Use cool/blue tones (negative warmth, lift_b > 0) or cinematic teal"}`,
+				);
+				return parts.join(". ");
+			}
+
+			// Full video (unsplit): return overall counts
 			let scenery = 0;
 			let person = 0;
 			for (const s of sm.scenes)
@@ -354,6 +591,182 @@ const TOOLS: Record<string, ToolDef> = {
 				},
 			]);
 			return `Applied cinematic grade to the target clip (${n} op).`;
+		},
+	},
+
+	grade_scenes_vision: {
+		schema: {
+			type: "function",
+			function: {
+				name: "grade_scenes_vision",
+				description:
+					"Let an AI colorist actually LOOK at each scene's frame (vision) and design a bespoke, tasteful colour grade for every scene — tuned to that scene's real light/subject/mood, visibly distinct from its neighbours, and cohesive across the montage. This is the correct tool whenever the user wants each scene coloured differently/appropriately ('different color for each scene', 'appropriate color grading'). Call it AFTER cutting into scenes. It reads the pixels and self-tunes — do NOT hand-roll adjust_color per clip or apply fixed presets for this goal.",
+				parameters: { type: "object", properties: {} },
+			},
+		},
+		run: async (_args, editor) => {
+			const { scenes, indexToClip } = await extractSceneFrames(editor);
+			if (scenes.length === 0)
+				return "Could not extract scene frames to grade — cut into scenes first, or the media source is unavailable.";
+
+			let data: any;
+			try {
+				data = await callVisionScenes("/api/ai/grade-scenes", scenes);
+			} catch (e: any) {
+				return `Vision grading request failed: ${e?.message ?? e}`;
+			}
+			if (!data || data.error)
+				return `Vision grading failed: ${data?.error ?? "unknown error"}`;
+
+			const grades = Array.isArray(data.grades) ? data.grades : [];
+			if (grades.length === 0) return "The colorist returned no grades.";
+
+			const ops: any[] = [];
+			const notes: string[] = [];
+			for (const g of grades) {
+				const clip = indexToClip[g.scene];
+				if (!clip || !g.params || typeof g.params !== "object") continue;
+				ops.push({ action: "adjust_color", clip_id: clip.id, params: g.params });
+				if (g.rationale) notes.push(`scene ${g.scene}: ${g.rationale}`);
+			}
+			const n = await runOps(editor, ops);
+			return n > 0
+				? `Vision colorist graded ${n} scenes — each frame was looked at and tuned individually.\n${notes
+						.slice(0, 12)
+						.join("\n")}`
+				: "Could not apply the vision grades.";
+		},
+	},
+
+	curate_scenes_vision: {
+		schema: {
+			type: "function",
+			function: {
+				name: "curate_scenes_vision",
+				description:
+					"Let an AI editor LOOK at each scene's frame (vision) and decide which shots to KEEP and which to CUT — dropping blurry, badly-exposed, empty/black, shaky or near-duplicate scenes and keeping the strong, varied ones. Use this whenever the user wants to trim/clean up footage, remove bad or boring shots, or auto-select the best scenes ('curate scenes', 'remove bad/boring shots', 'select beautiful scenes'). Call it AFTER cutting into scenes. It reads the pixels and judges quality — never deletes every scene.",
+				parameters: { type: "object", properties: {} },
+			},
+		},
+		run: async (_args, editor) => {
+			const { scenes, indexToClip } = await extractSceneFrames(editor);
+			if (scenes.length === 0)
+				return "Could not extract scene frames — cut into scenes first, or the media source is unavailable.";
+
+			let data: any;
+			try {
+				data = await callVisionScenes("/api/ai/curate-scenes", scenes);
+			} catch (e: any) {
+				return `Scene curation request failed: ${e?.message ?? e}`;
+			}
+			if (!data || data.error)
+				return `Scene curation failed: ${data?.error ?? "unknown error"}`;
+
+			const judged = Array.isArray(data.scenes) ? data.scenes : [];
+			if (judged.length === 0) return "The reviewer returned no decisions.";
+
+			// Collect clips the reviewer wants to cut.
+			const cutList: any[] = [];
+			const cutReasons: string[] = [];
+			for (const j of judged) {
+				const clip = indexToClip[j.scene];
+				if (!clip) continue;
+				if (j.keep === false) {
+					cutList.push(clip);
+					cutReasons.push(`cut scene ${j.scene}: ${j.reason ?? ""}`.trim());
+				}
+			}
+			if (cutList.length === 0)
+				return `Reviewed ${scenes.length} scenes with vision — all worth keeping, nothing cut.`;
+			// Safety: never empty the timeline.
+			if (cutList.length >= scenes.length)
+				return `The reviewer flagged all ${scenes.length} scenes — skipping the delete so the timeline is not emptied. Consider re-shooting or lowering the bar.`;
+
+			const { DeleteElementsCommand } = await import(
+				"@/lib/commands/timeline/element"
+			);
+			const dels = cutList
+				.map((c) => {
+					const { track } = resolveClip(editor, c.id);
+					return track ? { trackId: track.id, elementId: c.id } : null;
+				})
+				.filter(Boolean) as Array<{ trackId: string; elementId: string }>;
+			if (dels.length === 0) return "Could not resolve scenes to cut.";
+			editor.command.execute({
+				command: new DeleteElementsCommand({ elements: dels }),
+			});
+
+			// Ripple-close the gaps the deletions left.
+			const track = videoTrackOf(editor);
+			if (track) {
+				const { UpdateElementStartTimeCommand } = await import(
+					"@/lib/commands/timeline/element"
+				);
+				const { BatchCommand } = await import("@/lib/commands/batch-command");
+				const sorted = [...track.elements].sort(
+					(a: any, b: any) => a.startTime - b.startTime,
+				);
+				const cmds: any[] = [];
+				let cursor = 0;
+				for (const el of sorted) {
+					if (Math.abs(el.startTime - cursor) > 0.001) {
+						cmds.push(
+							new UpdateElementStartTimeCommand({
+								elements: [{ trackId: track.id, elementId: el.id }],
+								startTime: cursor,
+							}),
+						);
+					}
+					cursor += el.duration;
+				}
+				if (cmds.length > 0)
+					editor.command.execute({ command: new BatchCommand(cmds) });
+			}
+
+			return `Vision editor cut ${dels.length} weak scenes, kept ${scenes.length - dels.length}, and closed the gaps.\n${cutReasons
+				.slice(0, 12)
+				.join("\n")}`;
+		},
+	},
+
+	adjust_color: {
+		schema: {
+			type: "function",
+			function: {
+				name: "adjust_color",
+				description:
+					"Adjust a clip's color wheels, warmth, saturation, contrast, or exposure. Use this to style individual scenes appropriately (e.g. cold blue tones for nature/winter, warm yellow/red tones for humans/indoor warmth, or cinematic contrast adjustments).",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						lift_r: { type: "number", description: "Shadows Red shift (-0.5 to 0.5)" },
+						lift_g: { type: "number", description: "Shadows Green shift (-0.5 to 0.5)" },
+						lift_b: { type: "number", description: "Shadows Blue shift (-0.5 to 0.5)" },
+						gain_r: { type: "number", description: "Highlights Red gain (0.5 to 2.0)" },
+						gain_g: { type: "number", description: "Highlights Green gain (0.5 to 2.0)" },
+						gain_b: { type: "number", description: "Highlights Blue gain (0.5 to 2.0)" },
+						contrast: { type: "number", description: "Contrast (-1.0 to 1.0)" },
+						saturation: { type: "number", description: "Saturation (-1.0 to 1.0)" },
+						exposure: { type: "number", description: "Exposure (-2.0 to 2.0)" },
+						warmth: { type: "number", description: "Warmth factor (-1.0 to 1.0; negative is cold/blue, positive is warm/yellow)" },
+					},
+					required: ["clip_id"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const { clip_id, ...params } = args;
+			const n = await runOps(editor, [
+				{
+					action: "adjust_color",
+					clip_id,
+					params,
+				},
+			]);
+			return n > 0
+				? `Adjusted color of clip ${clip_id} with custom parameters.`
+				: `Could not apply color adjustments to clip ${clip_id}.`;
 		},
 	},
 
@@ -1117,6 +1530,412 @@ const TOOLS: Record<string, ToolDef> = {
 			});
 		},
 	},
+
+	delete_clip: {
+		schema: {
+			type: "function",
+			function: {
+				name: "delete_clip",
+				description: "Delete a specific clip from the timeline by its ID.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+					},
+					required: ["clip_id"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "delete",
+					clip_id: args.clip_id,
+				},
+			]);
+			return n > 0
+				? `Deleted clip ${args.clip_id} from the timeline.`
+				: `Could not delete clip ${args.clip_id}.`;
+		},
+	},
+
+	change_speed: {
+		schema: {
+			type: "function",
+			function: {
+				name: "change_speed",
+				description: "Change the playback speed of a clip (slow motion or fast forward) with optional retime curves.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						speed: { type: "number", description: "Speed multiplier (e.g., 0.5 for 50% slow motion, 2.0 for 200% fast forward)" },
+						maintain_pitch: { type: "boolean", description: "Whether to maintain audio pitch (default: true)" },
+						reverse: { type: "boolean", description: "Whether to play the clip in reverse (default: false)" },
+						curve: { type: "string", enum: ["ease_in", "ease_out", "ease_in_out"], description: "Easing curve for speed change" },
+					},
+					required: ["clip_id", "speed"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "change_speed",
+					clip_id: args.clip_id,
+					speed: args.speed,
+					maintain_pitch: args.maintain_pitch ?? true,
+					reverse: args.reverse ?? false,
+					curve: args.curve,
+				},
+			]);
+			return n > 0
+				? `Changed playback speed of clip ${args.clip_id} to ${args.speed}x.`
+				: `Could not change speed of clip ${args.clip_id}.`;
+		},
+	},
+
+	split_clip: {
+		schema: {
+			type: "function",
+			function: {
+				name: "split_clip",
+				description: "Split a specific clip into two separate clips at a given global timeline timestamp (in seconds).",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						time: { type: "number", description: "Global timeline seconds where the split should happen" },
+					},
+					required: ["clip_id", "time"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "split",
+					clip_id: args.clip_id,
+					time: args.time,
+				},
+			]);
+			return n > 0
+				? `Split clip ${args.clip_id} at timeline position ${args.time}s.`
+				: `Could not split clip ${args.clip_id} at position ${args.time}s.`;
+		},
+	},
+
+	trim_clip: {
+		schema: {
+			type: "function",
+			function: {
+				name: "trim_clip",
+				description: "Trim a clip to keep only a specific range (start and end in seconds, relative to the clip's original media).",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						start: { type: "number", description: "Start time in seconds relative to source media (to keep)" },
+						end: { type: "number", description: "End time in seconds relative to source media (to keep)" },
+					},
+					required: ["clip_id", "start", "end"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "trim",
+					clip_id: args.clip_id,
+					start: args.start,
+					end: args.end,
+				},
+			]);
+			return n > 0
+				? `Trimmed clip ${args.clip_id} to range [${args.start}s, ${args.end}s].`
+				: `Could not trim clip ${args.clip_id}.`;
+		},
+	},
+
+	j_l_cut: {
+		schema: {
+			type: "function",
+			function: {
+				name: "j_l_cut",
+				description: "Create a cinematic J-Cut or L-Cut. Positive offset creates L-Cut (audio from current clip overlaps into next video clip). Negative offset creates J-Cut (audio from next clip starts before the video).",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						offset: { type: "number", description: "Offset in seconds (negative for J-Cut, positive for L-Cut)" },
+					},
+					required: ["clip_id", "offset"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "demux_audio",
+					clip_id: args.clip_id,
+					offset: args.offset,
+				},
+			]);
+			return n > 0
+				? `Created J/L-Cut on clip ${args.clip_id} with offset ${args.offset}s.`
+				: `Could not create J/L-Cut on clip ${args.clip_id}.`;
+		},
+	},
+
+	add_overlay: {
+		schema: {
+			type: "function",
+			function: {
+				name: "add_overlay",
+				description: "Add a picture-in-picture overlay (image/video) on top of the timeline.",
+				parameters: {
+					type: "object",
+					properties: {
+						asset_id: { type: "string", description: "ID of the media asset from library" },
+						overlay_type: { type: "string", enum: ["video", "image"] },
+						name: { type: "string", description: "Visual label for the overlay" },
+						start: { type: "number", description: "Timeline start position in seconds" },
+						duration: { type: "number", description: "Duration in seconds" },
+						x: { type: "number", description: "Canvas X coordinate (default: 0)" },
+						y: { type: "number", description: "Canvas Y coordinate (default: 0)" },
+						scale: { type: "number", description: "Scale multiplier (default: 0.5)" },
+						rotation: { type: "number", description: "Rotation angle in degrees (default: 0)" },
+					},
+					required: ["asset_id", "overlay_type", "start", "duration"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "add_overlay",
+					asset_id: args.asset_id,
+					overlay_type: args.overlay_type,
+					name: args.name || "Overlay",
+					start: args.start,
+					duration: args.duration,
+					x: args.x ?? 0,
+					y: args.y ?? 0,
+					scale: args.scale ?? 0.5,
+					rotation: args.rotation ?? 0,
+				},
+			]);
+			return n > 0
+				? `Added overlay to the timeline starting at ${args.start}s.`
+				: `Could not add overlay.`;
+		},
+	},
+
+	add_mask: {
+		schema: {
+			type: "function",
+			function: {
+				name: "add_mask",
+				description: "Apply a geometric mask (cropping/shaping) to a specific clip.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						mask_type: { type: "string", enum: ["rectangle", "ellipse"] },
+						invert: { type: "boolean", description: "Invert the mask selection (default: false)" },
+						feather: { type: "number", description: "Mask border softness feather in pixels (default: 10)" },
+					},
+					required: ["clip_id", "mask_type"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "add_mask",
+					clip_id: args.clip_id,
+					mask_type: args.mask_type,
+					invert: args.invert ?? false,
+					feather: args.feather ?? 10,
+				},
+			]);
+			return n > 0
+				? `Added mask to clip ${args.clip_id}.`
+				: `Could not apply mask to clip ${args.clip_id}.`;
+		},
+	},
+
+	add_subtitle: {
+		schema: {
+			type: "function",
+			function: {
+				name: "add_subtitle",
+				description: "Add a text subtitle to the timeline.",
+				parameters: {
+					type: "object",
+					properties: {
+						text: { type: "string", description: "Subtitle text content" },
+						start: { type: "number", description: "Start time on global timeline in seconds" },
+						end: { type: "number", description: "End time on global timeline in seconds" },
+					},
+					required: ["text", "start", "end"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "add_subtitle",
+					text: args.text,
+					start: args.start,
+					end: args.end,
+				},
+			]);
+			return n > 0
+				? `Added subtitle text: "${args.text}" from ${args.start}s to ${args.end}s.`
+				: `Could not add subtitle.`;
+		},
+	},
+
+	duplicate_clip: {
+		schema: {
+			type: "function",
+			function: {
+				name: "duplicate_clip",
+				description: "Duplicate a clip onto a new parallel track layer.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						with_mask: { type: "boolean", description: "Duplicate with a mask (default: false)" },
+						mask_type: { type: "string", enum: ["rectangle", "ellipse"] },
+						invert: { type: "boolean" },
+						feather: { type: "number" },
+					},
+					required: ["clip_id"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "duplicate_layer",
+					clip_id: args.clip_id,
+					with_mask: args.with_mask ?? false,
+					mask_type: args.mask_type,
+					invert: args.invert ?? false,
+					feather: args.feather ?? 10,
+				},
+			]);
+			return n > 0
+				? `Duplicated clip ${args.clip_id} to a new layer.`
+				: `Could not duplicate clip ${args.clip_id}.`;
+		},
+	},
+
+	adjust_blend: {
+		schema: {
+			type: "function",
+			function: {
+				name: "adjust_blend",
+				description: "Adjust opacity and blend modes for overlay overlay composites.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string" },
+						opacity: { type: "number", description: "Opacity value (0.0 to 1.0)" },
+						blend_mode: { type: "string", enum: ["normal", "multiply", "screen", "overlay", "darken"] },
+					},
+					required: ["clip_id", "opacity", "blend_mode"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "blend_mode",
+					clip_id: args.clip_id,
+					opacity: args.opacity,
+					blend_mode: args.blend_mode,
+				},
+			]);
+			return n > 0
+				? `Adjusted blend mode of clip ${args.clip_id} to ${args.blend_mode} with opacity ${args.opacity}.`
+				: `Could not adjust blend mode of clip ${args.clip_id}.`;
+		},
+	},
+
+	upsert_keyframe: {
+		schema: {
+			type: "function",
+			function: {
+				name: "upsert_keyframe",
+				description: "Add or update a keyframe for a clip property (e.g., scale, rotate, opacity, x, y) at a specific relative time inside the clip.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string", description: "Target clip ID" },
+						property: { type: "string", enum: ["scale", "rotate", "opacity", "x", "y"], description: "The animated property" },
+						time: { type: "number", description: "Time offset in seconds relative to the clip's start" },
+						value: { type: "number", description: "Numeric value of the property at this keyframe" },
+						interpolation: { type: "string", enum: ["linear", "hold", "ease_in", "ease_out", "ease_in_out"], description: "Interpolation curve to next keyframe (default: linear)" },
+					},
+					required: ["clip_id", "property", "time", "value"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const kfId = `kf-${Math.random().toString(36).substr(2, 9)}`;
+			const n = await runOps(editor, [
+				{
+					action: "upsert_keyframe",
+					clip_id: args.clip_id,
+					property: args.property,
+					keyframe: {
+						id: kfId,
+						time: args.time,
+						value: args.value,
+						interpolation: args.interpolation ?? "linear",
+					},
+				},
+			]);
+			return n > 0
+				? `Upserted keyframe for ${args.property} on clip ${args.clip_id} at ${args.time}s.`
+				: `Could not upsert keyframe.`;
+		},
+	},
+
+	delete_keyframe: {
+		schema: {
+			type: "function",
+			function: {
+				name: "delete_keyframe",
+				description: "Delete an existing keyframe from a clip.",
+				parameters: {
+					type: "object",
+					properties: {
+						clip_id: { type: "string", description: "Target clip ID" },
+						property: { type: "string", description: "Target property (scale, rotate, opacity, x, y)" },
+						keyframe_id: { type: "string", description: "ID of the keyframe to delete" },
+					},
+					required: ["clip_id", "property", "keyframe_id"],
+				},
+			},
+		},
+		run: async (args, editor) => {
+			const n = await runOps(editor, [
+				{
+					action: "delete_keyframe",
+					clip_id: args.clip_id,
+					property: args.property,
+					keyframe_id: args.keyframe_id,
+				},
+			]);
+			return n > 0
+				? `Deleted keyframe ${args.keyframe_id} on clip ${args.clip_id}.`
+				: `Could not delete keyframe.`;
+		},
+	},
 };
 
 // The most recent mimic_style analysis, kept so save_style can persist it.
@@ -1163,8 +1982,40 @@ const SYSTEM_PROMPT = `You are ChronoX, an autonomous cinematic video-editing ag
 You accomplish the user's goal by calling the available editing tools — ONE step at a time.
 After each tool result, decide the next step based on what actually happened.
 
+=== 4-LAYER VERIFICATION PIPELINE ===
+For every request, you MUST mentally execute and verify through these 4 verification layers:
+
+1. LAYER 1: Context Retrieval & Ingestion
+   - Retrieve all timeline clips using list_clips.
+   - For any target video clip, retrieve its visual ingest details (tags, brightness, contrast) by calling analyze_scenes to "see" the footage.
+   - Cross-reference with the editing knowledge (NotebookLM rules, J-cuts, match cuts) and SurfSense semantic memory (episodic keeper decisions).
+
+2. LAYER 2: Multi-Agent Visual Reasoning (Intent Reasoning & Error vs. Technique Distinction)
+   - Analyze the visual properties returned by analyze_scenes.
+   - You MUST distinguish between:
+     * UNINTENTIONAL mistakes: Out-of-focus blurry footage, dark/underexposed camera errors (these should be trimmed, color corrected, or cut out).
+     * INTENTIONAL techniques: Cinematic glow/blur transitions, stylized low-light grading, intentional shadows (these should be preserved or enhanced).
+   - If the user says "cut boring/blurry scenes", target clips that have actual blurry tags or low quality/extreme contrast issues.
+
+3. LAYER 3: Constraints & Rules Filtering (Golden Rules & Constraints)
+   - Enforce these strict editing constraints on every command:
+     * Audio voiceover/dialogue volume: Peak -6dB to -3dB.
+     * Background music: Call apply_ducking to reduce background music by -12dB when dialogue is present.
+     * Cuts: Every audio cut MUST have a crossfade transition (2-5 frames) to avoid click/pop sounds.
+     * Motion: Avoid linear keyframes. Call set_easing with 'ease_in_out' for all punch-in, zoom, and text moves.
+     * Genre: Talkshows must keep speech clear (enhance_speech) and avoid complex transitions/letterboxes. Cinematic/montage must cut on beats (fit_clips_to_audio).
+
+4. LAYER 4: Direct Execution & Memory Write-back (Execution & Memory Logging)
+   - Perform the validated atomic edits directly on the timeline.
+   - Keep a mental log of applied operations so they write back to the episodic memory loop (KEEP/DELETE feedback).
+
 Rules:
+- If the user says the plan / brief / script / shot list is in Notion (or asks to edit according to Notion / brief), call load_brief_from_notion FIRST and treat its returned brief as the authoritative goal for the whole edit.
 - Call list_clips first to discover the clips and their ids.
+- After splitting a clip (via cut_into_scenes or split), you MUST call list_clips again to discover the new clip IDs before applying color adjustments, grading, or effects to them!
+- When the user asks you to perform multiple operations in a single prompt (e.g. split into scenes AND grade them), do not stop after the first step. You MUST loop through the clips, analyze them, and execute color grading (using adjust_color) or effects step-by-step until all parts of the user request are fully satisfied.
+- CRITICAL — PER-SCENE COLOR GRADING: When the user wants each scene coloured differently or "appropriately" ("different color for each scene", "appropriate color grading", "each scene a different/fitting colour"), call grade_scenes_vision ONCE after cutting into scenes. An AI colorist LOOKS at each scene's actual frame and designs a bespoke grade — distinct per scene, tuned to real content, cohesive overall. Do NOT hand-roll adjust_color per clip and do NOT apply fixed presets/category rules for this goal: that makes same-tag scenes identical and produces flat, ugly tints — exactly the bug to avoid. Only use per-clip adjust_color when the user asks to grade ONE specific shot a particular way.
+- VISION SCENE SELECTION: When the user wants to clean up / trim footage, remove bad or boring shots, or auto-pick the best scenes ("curate scenes", "remove bad/blurry/boring shots", "keep beautiful scenes", "select appropriate scenes"), call curate_scenes_vision ONCE after cutting into scenes. An AI editor LOOKS at each frame and keeps the strong, varied shots while cutting blurry/badly-exposed/empty/duplicate ones, then closes the gaps. Prefer this over keep_only_scenery (which only filters by a coarse person/scenery tag) unless the user specifically asks to remove people.
 - Before cutting or filtering by scene, call analyze_scenes to understand the footage.
 - Use the real clip_id values returned by the tools — never invent ids.
 - Do not repeat a tool that already succeeded.
@@ -1197,13 +2048,12 @@ Skip any step the user did not ask for.`;
 export interface RunAgentOptions {
 	editor: any;
 	goal: string;
-	/** Which LLM drives the agent loop: "ollama" | "gemini" | "openai" | "grok" | "anthropic". */
+	/** Which LLM drives the agent loop: "gemini" | "openai" | "grok" | "anthropic" | "ollama". */
 	provider?: string;
 	/** Provider model id (defaults per provider on the backend). */
 	model?: string;
 	/** User-supplied API key from the in-app provider settings. */
 	apiKey?: string;
-	localModel?: string; // legacy alias for the ollama model
 	maxSteps?: number;
 	onEvent?: (e: AgentEvent) => void;
 	/**
@@ -1222,10 +2072,9 @@ export interface RunAgentOptions {
 export async function runEditingAgent({
 	editor,
 	goal,
-	provider = process.env.NEXT_PUBLIC_AI_PROVIDER || "ollama",
+	provider = process.env.NEXT_PUBLIC_AI_PROVIDER || "gemini",
 	model = process.env.NEXT_PUBLIC_AI_MODEL,
 	apiKey,
-	localModel = "qwen3.5:9b",
 	maxSteps = 16,
 	onEvent,
 	onAskUser,
@@ -1278,7 +2127,6 @@ export async function runEditingAgent({
 					provider,
 					model,
 					api_key: apiKey,
-					local_model: localModel,
 				}),
 				signal,
 			});
@@ -1383,8 +2231,8 @@ export async function runEditingAgent({
 				result = `Tool ${name} failed: ${err?.message ?? err}`;
 			}
 			onEvent?.({ type: "tool", tool: name, args, result });
-			// Carry tool_call_id + name so OpenAI/Grok/Gemini can correlate the
-			// result with its call (Ollama ignores the extra fields).
+			// Carry tool_call_id + name so the provider can correlate the
+			// result with its call.
 			messages.push({
 				role: "tool",
 				tool_call_id: tc.id,
